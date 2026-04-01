@@ -1,0 +1,12 @@
+.{
+    .name = .infer_base,
+    .fingerprint = 0x888a0229f2f70a72,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
