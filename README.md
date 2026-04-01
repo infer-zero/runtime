@@ -15,6 +15,17 @@ Core abstractions for LLM inference: tensor types, tokenization, sampling, and a
 
 ## Usage
 
+```bash
+zig fetch --save git+https://github.com/infer-zero/base
+```
+
+Then in your `build.zig`:
+
+```zig
+const base_dep = b.dependency("infer_base", .{ .target = target, .optimize = optimize });
+my_mod.addImport("base", base_dep.module("infer_base"));
+```
+
 ```zig
 const base = @import("base");
 
