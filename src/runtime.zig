@@ -58,7 +58,10 @@ pub const Context = struct {
         const tokens = try self.runtime.tokenizer.encode(self.runtime.allocator, prompt);
         defer self.runtime.allocator.free(tokens);
 
+        const prev_len = self.history.items.len;
         try self.history.appendSlice(self.runtime.allocator, tokens);
+        errdefer self.history.shrinkRetainingCapacity(prev_len);
+
         try self.runtime.model.prefill(self.context, tokens);
         self.current_token = tokens[tokens.len - 1];
     }
@@ -70,7 +73,7 @@ pub const Context = struct {
             return null;
         }
         if (self.history.items.len >= self.runtime.max_len) {
-            return null;
+            return error.ContextFull;
         }
 
         const logits = try self.runtime.model.next(self.context, self.current_token);
