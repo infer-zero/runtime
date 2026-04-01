@@ -124,3 +124,63 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Vocabulary = @import("vocabulary.zig");
 const Message = @import("message.zig");
+
+test "model wrap and runtime integration" {
+    const testing = std.testing;
+    const Runtime = @import("runtime.zig");
+
+    const MockModel = struct {
+        eos_token_id: u32 = 2,
+        config: struct { vocabulary_size: usize = 4, max_len: usize = 16 } = .{},
+        logits: [4]f32 = .{ 0.0, 0.0, 1.0, 0.0 }, // always predict token 2 (eos)
+
+        pub const Context = struct { dummy: u8 = 0 };
+
+        pub fn deinit(_: *@This()) void {}
+
+        pub fn vocabulary(_: *@This()) Vocabulary {
+            return .{
+                .merge_index = .{},
+                .encoding = .{},
+                .decoding = .{},
+            };
+        }
+
+        pub fn createContext(_: *@This()) !*Context {
+            return try testing.allocator.create(Context);
+        }
+
+        pub fn destroyContext(_: *@This(), ctx: *Context) void {
+            testing.allocator.destroy(ctx);
+        }
+
+        pub fn prefill(_: *@This(), _: *Context, _: []const u32) !void {}
+
+        pub fn next(self: *@This(), _: *Context, _: u32) ![]const f32 {
+            return &self.logits;
+        }
+
+        pub fn chatFormat(_: Allocator, _: []const Message) ![]const u8 {
+            return "mock";
+        }
+    };
+
+    var mock = MockModel{};
+    var m = wrap(MockModel).init(&mock).model();
+
+    // Exercise the vtable interface
+    var runtime = Runtime.init(testing.allocator, m, .{});
+    var ctx = try runtime.start();
+    defer ctx.deinit();
+
+    // Prefill with dummy tokens
+    try m.prefill(ctx.context, &.{ 0, 1 });
+
+    // Next should return logits via vtable
+    const logits = try m.next(ctx.context, 1);
+    try testing.expectEqual(@as(usize, 4), logits.len);
+    try testing.expectEqual(@as(f32, 1.0), logits[2]);
+
+    // Cleanup
+    m.deinit();
+}

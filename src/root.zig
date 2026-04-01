@@ -8,9 +8,12 @@ pub const Message = @import("message.zig");
 pub const Runtime = @import("runtime.zig");
 
 test {
+    _ = Tensor;
     _ = Vocabulary;
     _ = Tokenizer;
     _ = Sampler;
+    _ = Meta;
     _ = Model;
+    _ = Message;
     _ = Runtime;
 }
