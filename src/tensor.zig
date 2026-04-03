@@ -23,6 +23,7 @@ pub const DataType = enum(u8) {
     Q4_0 = 4,
     Q6_K = 5,
     Q4_1 = 6,
+    Q4_K = 7,
     _,
 
     pub fn fromString(dtype_str: []const u8) @This() {
@@ -37,6 +38,7 @@ pub const DataType = enum(u8) {
             .Q4_0 => std.math.mul(usize, num_elements / Q4_0_BLOCK_SIZE, Q4_0_BLOCK_BYTES),
             .Q4_1 => std.math.mul(usize, num_elements / Q4_1_BLOCK_SIZE, Q4_1_BLOCK_BYTES),
             .Q6_K => std.math.mul(usize, num_elements / Q6_K_BLOCK_SIZE, Q6_K_BLOCK_BYTES),
+            .Q4_K => std.math.mul(usize, num_elements / Q4_K_BLOCK_SIZE, Q4_K_BLOCK_BYTES),
             else => unreachable,
         };
     }
@@ -49,6 +51,7 @@ pub const DataType = enum(u8) {
             .Q4_0 => (num_bytes / Q4_0_BLOCK_BYTES) * Q4_0_BLOCK_SIZE,
             .Q4_1 => (num_bytes / Q4_1_BLOCK_BYTES) * Q4_1_BLOCK_SIZE,
             .Q6_K => (num_bytes / Q6_K_BLOCK_BYTES) * Q6_K_BLOCK_SIZE,
+            .Q4_K => (num_bytes / Q4_K_BLOCK_BYTES) * Q4_K_BLOCK_SIZE,
             else => unreachable,
         };
     }
@@ -165,6 +168,63 @@ pub const DataType = enum(u8) {
                 }
                 return result;
             },
+            .Q4_K => {
+                // Q4_K: 256 elements per block, 144 bytes per block
+                // Layout: d[2] + dmin[2] + scales[12] + qs[128]
+                // Matches GGML dequantize_row_q4_K reference implementation.
+                if (data.len % Q4_K_BLOCK_BYTES != 0) return error.InvalidData;
+                const num_blocks = data.len / Q4_K_BLOCK_BYTES;
+                const result = try allocator.alloc(f32, num_blocks * Q4_K_BLOCK_SIZE);
+                for (0..num_blocks) |block_idx| {
+                    const block = data[block_idx * Q4_K_BLOCK_BYTES ..][0..Q4_K_BLOCK_BYTES];
+                    const d: f32 = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, block[0..2], .little))));
+                    const dmin: f32 = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, block[2..4], .little))));
+                    const scales_raw = block[4..16];
+                    const qs = block[16..144];
+                    const out = result[block_idx * Q4_K_BLOCK_SIZE ..][0..Q4_K_BLOCK_SIZE];
+
+                    // Unpack 6-bit scales and mins from 12-byte packed array.
+                    // Layout: scales_raw[0..3] hold lower 6 bits of scales 0-3,
+                    // scales_raw[4..7] hold lower 6 bits of mins 0-3,
+                    // scales_raw[8..11] hold upper 2 bits of scales 4-7 and mins 4-7.
+                    var scales_arr: [8]u8 = undefined;
+                    var mins_arr: [8]u8 = undefined;
+
+                    scales_arr[0] = scales_raw[0] & 0x3F;
+                    scales_arr[1] = scales_raw[1] & 0x3F;
+                    scales_arr[2] = scales_raw[2] & 0x3F;
+                    scales_arr[3] = scales_raw[3] & 0x3F;
+                    mins_arr[0] = scales_raw[4] & 0x3F;
+                    mins_arr[1] = scales_raw[5] & 0x3F;
+                    mins_arr[2] = scales_raw[6] & 0x3F;
+                    mins_arr[3] = scales_raw[7] & 0x3F;
+                    scales_arr[4] = (scales_raw[8] & 0x0F) | ((scales_raw[0] >> 6) << 4);
+                    scales_arr[5] = (scales_raw[9] & 0x0F) | ((scales_raw[1] >> 6) << 4);
+                    scales_arr[6] = (scales_raw[10] & 0x0F) | ((scales_raw[2] >> 6) << 4);
+                    scales_arr[7] = (scales_raw[11] & 0x0F) | ((scales_raw[3] >> 6) << 4);
+                    mins_arr[4] = (scales_raw[8] >> 4) | ((scales_raw[4] >> 6) << 4);
+                    mins_arr[5] = (scales_raw[9] >> 4) | ((scales_raw[5] >> 6) << 4);
+                    mins_arr[6] = (scales_raw[10] >> 4) | ((scales_raw[6] >> 6) << 4);
+                    mins_arr[7] = (scales_raw[11] >> 4) | ((scales_raw[7] >> 6) << 4);
+
+                    // Dequantize 4 groups of 64 elements (32 bytes each).
+                    // Each group uses 2 sub-block scales: low nibbles get scale[2j],
+                    // high nibbles get scale[2j+1]. Matches GGML dequantize_row_q4_K.
+                    for (0..4) |j| {
+                        const sc1: f32 = d * @as(f32, @floatFromInt(scales_arr[j * 2]));
+                        const m1: f32 = dmin * @as(f32, @floatFromInt(mins_arr[j * 2]));
+                        const sc2: f32 = d * @as(f32, @floatFromInt(scales_arr[j * 2 + 1]));
+                        const m2: f32 = dmin * @as(f32, @floatFromInt(mins_arr[j * 2 + 1]));
+                        const q_base = qs[j * 32 ..];
+                        const out_base = out[j * 64 ..];
+                        for (0..32) |l| {
+                            out_base[l] = sc1 * @as(f32, @floatFromInt(q_base[l] & 0x0F)) - m1;
+                            out_base[l + 32] = sc2 * @as(f32, @floatFromInt(q_base[l] >> 4)) - m2;
+                        }
+                    }
+                }
+                return result;
+            },
             else => {
                 log.err("unsupported data type for F32 conversion: {d}", .{@intFromEnum(self)});
                 return error.UnsupportedDataType;
@@ -199,7 +259,7 @@ pub const DataType = enum(u8) {
                 const f16_data: []const f16 = @alignCast(std.mem.bytesAsSlice(f16, data));
                 return try allocator.dupe(f16, f16_data);
             },
-            .Q8_0, .Q4_0, .Q4_1, .Q6_K => {
+            .Q8_0, .Q4_0, .Q4_1, .Q6_K, .Q4_K => {
                 const f32_data = try self.toF32(allocator, data);
                 defer allocator.free(f32_data);
                 const result = try allocator.alloc(f16, f32_data.len);
@@ -227,6 +287,9 @@ const Q4_1_BLOCK_BYTES = 2 + 2 + Q4_1_BLOCK_SIZE / 2; // f16 scale + f16 min + 1
 
 const Q6_K_BLOCK_SIZE = 256;
 const Q6_K_BLOCK_BYTES = 128 + 64 + 16 + 2; // ql[128] + qh[64] + scales[16] + d[2] = 210
+
+const Q4_K_BLOCK_SIZE = 256;
+const Q4_K_BLOCK_BYTES = 2 + 2 + 12 + 128; // d[2] + dmin[2] + scales[12] + qs[128] = 144
 
 const log = std.log.scoped(.infer);
 
