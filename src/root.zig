@@ -4,8 +4,9 @@ pub const Tokenizer = @import("tokenizer.zig");
 pub const Sampler = @import("sampler.zig");
 pub const Meta = @import("meta.zig");
 pub const Model = @import("model.zig");
-pub const Message = @import("message.zig");
+pub const Message = @import("message.zig").Message;
 pub const Runtime = @import("runtime.zig");
+pub const ChatSession = @import("chat_session.zig");
 
 test {
     _ = Tensor;
@@ -16,4 +17,5 @@ test {
     _ = Model;
     _ = Message;
     _ = Runtime;
+    _ = ChatSession;
 }

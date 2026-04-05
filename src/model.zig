@@ -6,6 +6,19 @@ max_len: usize,
 
 const Model = @This();
 
+pub const TokenClass = enum {
+    content,
+    thinking_start,
+    thinking_end,
+    tool_call_start,
+    tool_call_end,
+    end_of_turn,
+};
+
+pub const ChatOptions = struct {
+    thinking: bool = false,
+};
+
 pub const VTable = struct {
     deinit: *const fn (*Model) void,
     vocabulary: *const fn (*Model) Vocabulary,
@@ -13,7 +26,8 @@ pub const VTable = struct {
     destroyContext: *const fn (*Model, *anyopaque) void,
     prefill: *const fn (*Model, *anyopaque, []const u32) anyerror!void,
     next: *const fn (*Model, *anyopaque, u32) anyerror![]const f32,
-    chatFormat: *const fn (*Model, Allocator, []const Message) anyerror![]const u8,
+    chatFormat: *const fn (*Model, Allocator, []const Message, ChatOptions) anyerror![]const u8,
+    classifyToken: *const fn (*Model, u32) TokenClass,
 };
 
 /// Return a typed wrapper for the given concrete model type.
@@ -44,6 +58,7 @@ pub fn wrap(comptime T: type) type {
             .prefill = prefillFn,
             .next = nextFn,
             .chatFormat = chatFormatFn,
+            .classifyToken = classifyTokenFn,
         };
 
         fn deinitFn(m: *Model) void {
@@ -80,8 +95,16 @@ pub fn wrap(comptime T: type) type {
             return try concrete.next(typed_ctx, token);
         }
 
-        fn chatFormatFn(_: *Model, allocator: Allocator, messages: []const Message) anyerror![]const u8 {
-            return try T.chatFormat(allocator, messages);
+        fn chatFormatFn(_: *Model, allocator: Allocator, messages: []const Message, options: ChatOptions) anyerror![]const u8 {
+            return try T.chatFormat(allocator, messages, options);
+        }
+
+        fn classifyTokenFn(m: *Model, token: u32) TokenClass {
+            if (@hasDecl(T, "classifyToken")) {
+                const concrete: *T = @ptrCast(@alignCast(m.ptr));
+                return concrete.classifyToken(token);
+            }
+            return if (token == m.eos_token_id) .end_of_turn else .content;
         }
     };
 }
@@ -116,14 +139,18 @@ pub fn next(self: *@This(), ctx: *anyopaque, token: u32) ![]const f32 {
     return try self.vtable.next(self, ctx, token);
 }
 
-pub fn chatFormat(self: *@This(), allocator: Allocator, messages: []const Message) ![]const u8 {
-    return try self.vtable.chatFormat(self, allocator, messages);
+pub fn chatFormat(self: *@This(), allocator: Allocator, messages: []const Message, options: ChatOptions) ![]const u8 {
+    return try self.vtable.chatFormat(self, allocator, messages, options);
+}
+
+pub fn classifyToken(self: *@This(), token: u32) TokenClass {
+    return self.vtable.classifyToken(self, token);
 }
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Vocabulary = @import("vocabulary.zig");
-const Message = @import("message.zig");
+const Message = @import("message.zig").Message;
 
 test "model wrap and runtime integration" {
     const testing = std.testing;
@@ -160,7 +187,7 @@ test "model wrap and runtime integration" {
             return &self.logits;
         }
 
-        pub fn chatFormat(_: Allocator, _: []const Message) ![]const u8 {
+        pub fn chatFormat(_: Allocator, _: []const Message, _: ChatOptions) ![]const u8 {
             return "mock";
         }
     };
