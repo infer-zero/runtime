@@ -1,9 +1,11 @@
 allocator: std.mem.Allocator,
 arena: std.heap.ArenaAllocator,
+model: *Model,
+chat: Chat,
 runtime: *Runtime,
 context: Runtime.Context,
 messages: std.ArrayListUnmanaged(Message),
-options: Model.ChatOptions,
+options: Chat.ChatOptions,
 mode: Mode = .incremental,
 phase: Phase = .idle,
 content_buf: std.ArrayListUnmanaged(u8) = .empty,
@@ -58,24 +60,30 @@ pub const Event = union(enum) {
     end_of_turn,
 };
 
-/// Initialize a chat session bound to the given runtime. The session prefix
-/// (system_prompt + tools, rendered by the model's formatSystem) is prefilled
-/// into the KV cache once here. Subsequent sendText/sendToolResult calls then
-/// either append to the existing cache (`mode = .incremental`) or destroy and
-/// rebuild it on every turn (`mode = .full_replay`). See the `Mode` doc above.
+/// Initialize a chat session bound to the given model + runtime. The session
+/// prefix (system_prompt + tools, rendered by the model's chat.formatSystem)
+/// is prefilled into the KV cache once here. Subsequent sendText /
+/// sendToolResult calls then either append to the existing cache
+/// (`mode = .incremental`) or destroy and rebuild it on every turn
+/// (`mode = .full_replay`). See the `Mode` doc above.
 ///
-/// The model must implement the formatSystem/formatMessage API. Models that
-/// haven't been ported return error.NewApiNotImplemented from formatSystem.
+/// Returns `error.ModelDoesNotSupportChat` if `model.chat == null`. This
+/// is the capability check — ChatSession cannot drive a model without a
+/// Chat interface, and failing fast here is strictly better than surfacing
+/// an error mid-generation.
 pub fn init(
     allocator: std.mem.Allocator,
+    model: *Model,
     runtime: *Runtime,
-    options: Model.ChatOptions,
+    options: Chat.ChatOptions,
     mode: Mode,
 ) !@This() {
+    const chat = model.chat orelse return error.ModelDoesNotSupportChat;
+
     var context = try runtime.start();
     errdefer context.deinit();
 
-    const prefix = try runtime.model.formatSystem(allocator, options);
+    const prefix = try chat.formatSystem(allocator, options);
     defer allocator.free(prefix);
 
     if (prefix.len > 0) {
@@ -85,6 +93,8 @@ pub fn init(
     return .{
         .allocator = allocator,
         .arena = std.heap.ArenaAllocator.init(allocator),
+        .model = model,
+        .chat = chat,
         .runtime = runtime,
         .context = context,
         .messages = .empty,
@@ -134,7 +144,7 @@ pub fn sendToolResult(self: *@This(), tool_call_id: []const u8, content: []const
 fn prefillNewTurn(self: *@This(), msg: Message) !void {
     switch (self.mode) {
         .incremental => {
-            const turn = try self.runtime.model.formatMessage(
+            const turn = try self.chat.formatMessage(
                 self.allocator,
                 msg,
                 .{ .prime_assistant = true, .thinking = self.options.thinking },
@@ -157,14 +167,14 @@ fn rebuildContext(self: *@This()) !void {
     self.context = try self.runtime.start();
 
     // 1. System block.
-    const prefix = try self.runtime.model.formatSystem(self.allocator, self.options);
+    const prefix = try self.chat.formatSystem(self.allocator, self.options);
     defer self.allocator.free(prefix);
     if (prefix.len > 0) try self.context.prefill(prefix);
 
     // 2. All prior messages (everything except the just-appended new turn).
     const last_idx = self.messages.items.len - 1;
     for (self.messages.items[0..last_idx]) |prior_msg| {
-        const chunk = try self.runtime.model.formatMessage(
+        const chunk = try self.chat.formatMessage(
             self.allocator,
             prior_msg,
             .{
@@ -179,7 +189,7 @@ fn rebuildContext(self: *@This()) !void {
 
     // 3. The just-appended new message, with assistant prime.
     const last = self.messages.items[last_idx];
-    const turn = try self.runtime.model.formatMessage(
+    const turn = try self.chat.formatMessage(
         self.allocator,
         last,
         .{
@@ -208,9 +218,9 @@ pub fn next(self: *@This()) !?Event {
     const text = self.context.next() catch |err| {
         if (err == error.ContextFull) return try self.endTurn();
         return err;
-    } orelse return try self.endTurn();
+    };
 
-    const token_class = self.runtime.model.classifyToken(self.context.current_token);
+    const token_class = self.model.classifyToken(self.context.current_token);
 
     switch (token_class) {
         .thinking_start => {
@@ -236,6 +246,7 @@ pub fn next(self: *@This()) !?Event {
         },
         .end_of_turn => {
             self.allocator.free(text);
+            try self.absorbEndOfTurn();
             return try self.endTurn();
         },
         .content => {
@@ -255,6 +266,24 @@ pub fn next(self: *@This()) !?Event {
                 },
             }
         },
+    }
+}
+
+/// Commit the just-sampled end-of-turn token's KV slot, then tokenize and
+/// splice the model's per-turn suffix (e.g. "\n" after `<|im_end|>` in
+/// ChatML) into the cache. This keeps the cache aligned with the canonical
+/// chat template so the next prefill starts at the right inter-turn offset.
+/// Only called from the `.end_of_turn` branch of `next()`.
+fn absorbEndOfTurn(self: *@This()) !void {
+    try self.context.commitCurrent();
+
+    const suffix = self.chat.end_of_turn_suffix;
+    if (suffix.len == 0) return;
+
+    const suffix_tokens = try self.runtime.tokenizer.encode(self.allocator, suffix);
+    defer self.allocator.free(suffix_tokens);
+    for (suffix_tokens) |token| {
+        try self.context.absorb(token);
     }
 }
 
@@ -305,7 +334,7 @@ pub fn replay(self: *@This(), messages: []const Message) !void {
         // All replayed assistant messages are inherently prior turns: the next
         // sendText will append more dialogue after them. For Qwen3-style models
         // this means their <think> blocks (if any) get stripped.
-        const chunk = try self.runtime.model.formatMessage(
+        const chunk = try self.chat.formatMessage(
             self.allocator,
             msg,
             .{
@@ -429,4 +458,5 @@ fn dupeMessage(arena: std.mem.Allocator, msg: Message) !Message {
 const std = @import("std");
 const Runtime = @import("runtime.zig");
 const Model = @import("model.zig");
+const Chat = @import("chat.zig");
 const Message = @import("message.zig").Message;
