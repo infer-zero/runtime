@@ -287,19 +287,20 @@ pub const DataType = enum(u8) {
                     mins_arr[7] = (scales_raw[11] >> 4) | ((scales_raw[7] >> 6) << 4);
 
                     for (0..4) |j| {
-                        const sc1: f32 = d * @as(f32, @floatFromInt(scales_arr[j * 2]));
-                        const m1: f32 = dmin * @as(f32, @floatFromInt(mins_arr[j * 2]));
-                        const sc2: f32 = d * @as(f32, @floatFromInt(scales_arr[j * 2 + 1]));
-                        const m2: f32 = dmin * @as(f32, @floatFromInt(mins_arr[j * 2 + 1]));
+                        // Q5_K scale indexing: j for low nibble, j+4 for high nibble
+                        // (differs from Q4_K which uses j*2 and j*2+1)
+                        const sc1: f32 = d * @as(f32, @floatFromInt(scales_arr[j]));
+                        const m1: f32 = dmin * @as(f32, @floatFromInt(mins_arr[j]));
+                        const sc2: f32 = d * @as(f32, @floatFromInt(scales_arr[j + 4]));
+                        const m2: f32 = dmin * @as(f32, @floatFromInt(mins_arr[j + 4]));
                         const q_base = qs[j * 32 ..];
-                        const qh_base = qh[j * 8 ..];
                         const out_base = out[j * 64 ..];
                         for (0..32) |l| {
-                            const qh_byte = qh_base[l / 4];
-                            const qh_shift_lo: u3 = @intCast((l % 4) * 2);
-                            const qh_shift_hi: u3 = @intCast((l % 4) * 2 + 1);
-                            const lo5 = (q_base[l] & 0x0F) | (((qh_byte >> qh_shift_lo) & 1) << 4);
-                            const hi5 = (q_base[l] >> 4) | (((qh_byte >> qh_shift_hi) & 1) << 4);
+                            // Q5_K qh: qh[l] bit j for low nibble, bit j+4 for high nibble
+                            const qh_lo: u5 = @intCast((qh[l] >> @intCast(j)) & 1);
+                            const qh_hi: u5 = @intCast((qh[l] >> @intCast(j + 4)) & 1);
+                            const lo5 = (q_base[l] & 0x0F) | (qh_lo << 4);
+                            const hi5 = (q_base[l] >> 4) | (qh_hi << 4);
                             out_base[l] = sc1 * @as(f32, @floatFromInt(lo5)) - m1;
                             out_base[l + 32] = sc2 * @as(f32, @floatFromInt(hi5)) - m2;
                         }
