@@ -12,6 +12,7 @@ content_buf: std.ArrayListUnmanaged(u8) = .empty,
 thinking_buf: std.ArrayListUnmanaged(u8) = .empty,
 tool_call_buf: std.ArrayListUnmanaged(u8) = .empty,
 tool_calls: std.ArrayListUnmanaged(Message.ToolCall) = .empty,
+debug: bool = false,
 
 /// Strategy for assembling the KV cache across turns.
 ///
@@ -364,7 +365,8 @@ fn resetStreamingState(self: *@This()) void {
 /// in Hermes/Qwen3 convention) and append a `Message.ToolCall` to
 /// `self.tool_calls`. Synthesizes the id since Qwen3 tool calls don't carry
 /// one. Malformed JSON is silently dropped — the agent loop will then see no
-/// tool_calls and treat the turn as content-only.
+/// tool_calls and treat the turn as content-only. When `self.debug` is set,
+/// parse failures are logged to stderr for diagnostics.
 fn commitToolCall(self: *@This()) !void {
     const arena_alloc = self.arena.allocator();
     defer self.tool_call_buf.clearRetainingCapacity();
@@ -372,13 +374,25 @@ fn commitToolCall(self: *@This()) !void {
     const raw = std.mem.trim(u8, self.tool_call_buf.items, " \t\r\n");
     if (raw.len == 0) return;
 
-    const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, raw, .{}) catch return;
+    const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, raw, .{}) catch {
+        if (self.debug) debugToolCallDrop("JSON parse error", raw);
+        return;
+    };
     defer parsed.deinit();
-    if (parsed.value != .object) return;
+    if (parsed.value != .object) {
+        if (self.debug) debugToolCallDrop("top-level value is not an object", raw);
+        return;
+    }
     const obj = parsed.value.object;
 
-    const name_v = obj.get("name") orelse return;
-    if (name_v != .string) return;
+    const name_v = obj.get("name") orelse {
+        if (self.debug) debugToolCallDrop("missing \"name\" field", raw);
+        return;
+    };
+    if (name_v != .string) {
+        if (self.debug) debugToolCallDrop("\"name\" is not a string", raw);
+        return;
+    }
 
     const args_str: []u8 = if (obj.get("arguments")) |args_v|
         try std.json.Stringify.valueAlloc(self.allocator, args_v, .{})
@@ -394,6 +408,18 @@ fn commitToolCall(self: *@This()) !void {
         .name = try arena_alloc.dupe(u8, name_v.string),
         .arguments = try arena_alloc.dupe(u8, args_str),
     });
+}
+
+fn debugToolCallDrop(reason: []const u8, raw: []const u8) void {
+    const stderr = std.fs.File.stderr();
+    stderr.writeAll("debug: commitToolCall dropped — ") catch {};
+    stderr.writeAll(reason) catch {};
+    stderr.writeAll("\n  raw: \"") catch {};
+    // Truncate to avoid flooding stderr with huge payloads.
+    const preview = if (raw.len <= 200) raw else raw[0..200];
+    stderr.writeAll(preview) catch {};
+    if (raw.len > 200) stderr.writeAll("..." ) catch {};
+    stderr.writeAll("\"\n") catch {};
 }
 
 fn finalizeTurn(self: *@This()) !void {

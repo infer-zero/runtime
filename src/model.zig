@@ -103,12 +103,37 @@ pub fn init(comptime T: type, allocator: std.mem.Allocator, path: []const u8) !M
     else
         null;
 
+    if (chat != null) validateSpecialTokens(special_tokens);
+
     return .{
         .info = info,
         .inference = Inference.wrap(T).init(concrete).inference(),
         .chat = chat,
         .tool = null,
     };
+}
+
+/// Warn at init time about special-token misconfigurations that are easy to
+/// introduce (wrong token string, missing end marker) but hard to debug at
+/// runtime because the failure mode is silent (null lookup → feature disabled).
+fn validateSpecialTokens(st: Info.SpecialTokens) void {
+    const stderr = std.fs.File.stderr();
+
+    // Warn about unpaired start/end markers.
+    if (st.thinking_start != null and st.thinking_end == null)
+        stderr.writeAll("warning: thinking_start is set but thinking_end is null — thinking mode will not terminate cleanly\n") catch {};
+    if (st.thinking_end != null and st.thinking_start == null)
+        stderr.writeAll("warning: thinking_end is set but thinking_start is null — thinking blocks will never begin\n") catch {};
+    if (st.tool_call_start != null and st.tool_call_end == null)
+        stderr.writeAll("warning: tool_call_start is set but tool_call_end is null — tool calls will never be committed\n") catch {};
+    if (st.tool_call_end != null and st.tool_call_start == null)
+        stderr.writeAll("warning: tool_call_end is set but tool_call_start is null — tool call phase will never begin\n") catch {};
+
+    // Warn when no tool call tokens were found. Most models with chat support
+    // should have these — a null lookup usually means the token string in the
+    // variant's init doesn't match the tokenizer (e.g. <|tool_call|> vs <tool_call>).
+    if (st.tool_call_start == null and st.tool_call_end == null)
+        stderr.writeAll("warning: no tool_call_start/tool_call_end tokens found — tool calling will be disabled\n") catch {};
 }
 
 /// Re-exports of types that used to live on `Model` directly. Variants still
