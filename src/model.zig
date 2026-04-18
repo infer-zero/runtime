@@ -1,15 +1,18 @@
-//! Aggregate handle that composes a model's pure data (`Info`), its tight
-//! inference core (`Inference`), and optional capabilities (`Chat`, `Tool`).
-//! Each model variant's `load()` function constructs one of these by wiring
-//! its concrete implementation into an `Inference` and attaching whichever
-//! optional features it supports.
+//! Aggregate handle that composes a model's pure data, its tight inference
+//! core (`Inference`), and optional capabilities (`Chat`, `Tool`). Each
+//! variant's `load()` function constructs one of these by wiring its concrete
+//! implementation into an `Inference` and attaching whichever optional
+//! features it supports.
 //!
 //! Cross-cutting features (chat, tool-calling, eventually speculative
 //! decoding / grammar / LoRA / …) become new optional fields on this struct
 //! plus variant opt-in — no edits to unrelated variants, no base VTable
 //! changes.
 
-info: Info,
+eos_token_id: u32,
+vocabulary_size: usize,
+max_len: usize,
+special_tokens: SpecialTokens = .{},
 inference: Inference,
 chat: ?Chat = null,
 tool: ?Tool = null,
@@ -40,32 +43,32 @@ pub fn next(self: *Model, ctx: *anyopaque, token: u32) ![]const f32 {
     return try self.inference.next(ctx, token);
 }
 
-/// Classify a token via pure data lookup on `self.info.special_tokens`. Falls
-/// back to matching `info.eos_token_id` so models that only populate
+/// Classify a token via pure data lookup on `self.special_tokens`. Falls
+/// back to matching `eos_token_id` so models that only populate
 /// `eos_token_id` (and leave `special_tokens` defaulted) still see EOS as
 /// `.end_of_turn`.
 pub fn classifyToken(self: *const Model, token: u32) TokenClass {
-    const st = self.info.special_tokens;
+    const st = self.special_tokens;
     if (st.thinking_start) |id| if (token == id) return .thinking_start;
     if (st.thinking_end) |id| if (token == id) return .thinking_end;
     if (st.tool_call_start) |id| if (token == id) return .tool_call_start;
     if (st.tool_call_end) |id| if (token == id) return .tool_call_end;
     if (st.end_of_turn) |id| if (token == id) return .end_of_turn;
     if (st.end_of_turn_alt) |id| if (token == id) return .end_of_turn;
-    if (token == self.info.eos_token_id) return .end_of_turn;
+    if (token == self.eos_token_id) return .end_of_turn;
     return .content;
 }
 
 /// Generic factory: construct the aggregate `Model` for a concrete variant
 /// type `T` by calling `T.init(allocator, path)`, type-erasing it into an
-/// `Inference`, and attaching the `Info` / `Chat` pieces reflected from
-/// `T`'s public surface.
+/// `Inference`, and lifting the `Chat` piece reflected from `T`'s public
+/// surface.
 ///
 /// Required on `T`:
 ///   - `pub fn init(Allocator, []const u8) !*T`
 ///   - the six inference methods (`deinit`, `vocabulary`, `createContext`,
 ///     `destroyContext`, `prefill`, `next`) on `*T` with a `T.Context` type.
-///   - `eos_token_id: u32` field (for `Info.eos_token_id`).
+///   - `eos_token_id: u32` field.
 ///   - `config: *` field with `vocabulary_size: usize` and `max_len: usize`
 ///     sub-fields (matches every existing variant).
 ///
@@ -82,17 +85,10 @@ pub fn classifyToken(self: *const Model, token: u32) TokenClass {
 pub fn init(comptime T: type, allocator: std.mem.Allocator, path: []const u8) !Model {
     const concrete = try T.init(allocator, path);
 
-    const special_tokens: Info.SpecialTokens = if (@hasField(T, "special_tokens"))
+    const special_tokens: SpecialTokens = if (@hasField(T, "special_tokens"))
         concrete.special_tokens
     else
         .{};
-
-    const info: Info = .{
-        .eos_token_id = concrete.eos_token_id,
-        .vocabulary_size = concrete.config.vocabulary_size,
-        .max_len = concrete.config.max_len,
-        .special_tokens = special_tokens,
-    };
 
     const chat: ?Chat = if (@hasDecl(T, "formatSystem") and @hasDecl(T, "formatMessage"))
         .{
@@ -106,7 +102,10 @@ pub fn init(comptime T: type, allocator: std.mem.Allocator, path: []const u8) !M
     if (chat != null) validateSpecialTokens(special_tokens);
 
     return .{
-        .info = info,
+        .eos_token_id = concrete.eos_token_id,
+        .vocabulary_size = concrete.config.vocabulary_size,
+        .max_len = concrete.config.max_len,
+        .special_tokens = special_tokens,
         .inference = Inference.wrap(T).init(concrete).inference(),
         .chat = chat,
         .tool = null,
@@ -116,7 +115,7 @@ pub fn init(comptime T: type, allocator: std.mem.Allocator, path: []const u8) !M
 /// Warn at init time about special-token misconfigurations that are easy to
 /// introduce (wrong token string, missing end marker) but hard to debug at
 /// runtime because the failure mode is silent (null lookup → feature disabled).
-fn validateSpecialTokens(st: Info.SpecialTokens) void {
+fn validateSpecialTokens(st: SpecialTokens) void {
     const stderr = std.fs.File.stderr();
 
     // Warn about unpaired start/end markers.
@@ -136,15 +135,38 @@ fn validateSpecialTokens(st: Info.SpecialTokens) void {
         stderr.writeAll("warning: no tool_call_start/tool_call_end tokens found — tool calling will be disabled\n") catch {};
 }
 
-/// Re-exports of types that used to live on `Model` directly. Variants still
-/// import them as `@import("base").Model.ChatOptions` etc.; keeping these
-/// aliases avoids churning every variant's import list.
+/// Re-exports of chat-adjacent types. Variants import them as
+/// `@import("base").Model.ChatOptions` etc.; keeping these aliases avoids
+/// churning every variant's import list.
 pub const ChatOptions = Chat.ChatOptions;
 pub const MessageFormat = Chat.MessageFormat;
-pub const SpecialTokens = Info.SpecialTokens;
-pub const TokenClass = Info.TokenClass;
 
-const Info = @import("info.zig");
+/// Per-model semantic special-token IDs. Populated by each variant at init
+/// time from tokenizer lookups; consumed by `classifyToken` + `ChatSession`.
+/// All fields are `?u32`; null means "this model doesn't use that token
+/// class." `end_of_turn_alt` covers the second EOT some models have (Qwen
+/// uses `<|im_end|>` + `<|end_of_text|>`; Llama 3 uses `<|eot_id|>` +
+/// `<|end_of_text|>`; most other models have just one).
+pub const SpecialTokens = struct {
+    end_of_turn: ?u32 = null,
+    end_of_turn_alt: ?u32 = null,
+    thinking_start: ?u32 = null,
+    thinking_end: ?u32 = null,
+    tool_call_start: ?u32 = null,
+    tool_call_end: ?u32 = null,
+};
+
+/// Semantic classes used by `ChatSession` to drive its streaming state
+/// machine.
+pub const TokenClass = enum {
+    content,
+    thinking_start,
+    thinking_end,
+    tool_call_start,
+    tool_call_end,
+    end_of_turn,
+};
+
 const Inference = @import("inference.zig");
 const Chat = @import("chat.zig");
 const Tool = @import("tool.zig");
@@ -155,18 +177,16 @@ const testing = std.testing;
 
 test "classifyToken uses data path with eos fallback" {
     var m: Model = .{
-        .info = .{
-            .eos_token_id = 99,
-            .vocabulary_size = 0,
-            .max_len = 0,
-            .special_tokens = .{
-                .end_of_turn = 1,
-                .end_of_turn_alt = 2,
-                .thinking_start = 10,
-                .thinking_end = 11,
-                .tool_call_start = 20,
-                .tool_call_end = 21,
-            },
+        .eos_token_id = 99,
+        .vocabulary_size = 0,
+        .max_len = 0,
+        .special_tokens = .{
+            .end_of_turn = 1,
+            .end_of_turn_alt = 2,
+            .thinking_start = 10,
+            .thinking_end = 11,
+            .tool_call_start = 20,
+            .tool_call_end = 21,
         },
         .inference = undefined,
     };
@@ -184,11 +204,9 @@ test "classifyToken uses data path with eos fallback" {
 
 test "classifyToken with empty special_tokens falls back to eos only" {
     var m: Model = .{
-        .info = .{
-            .eos_token_id = 2,
-            .vocabulary_size = 0,
-            .max_len = 0,
-        },
+        .eos_token_id = 2,
+        .vocabulary_size = 0,
+        .max_len = 0,
         .inference = undefined,
     };
 

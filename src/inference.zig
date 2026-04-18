@@ -3,8 +3,8 @@
 //! tool awareness, no special-token data — those all live on the aggregate
 //! `Model` (which *has* an `Inference`) and on `Chat` / `Tool`.
 //!
-//! `Runtime` drives an `Inference` + `Info` directly. `ChatSession` layers
-//! on top of `Runtime` and brings in chat/tool concerns via the aggregate.
+//! `Runtime` drives an `Inference` directly. `ChatSession` layers on top of
+//! `Runtime` and brings in chat/tool concerns via the aggregate.
 
 ptr: *anyopaque,
 vtable: *const VTable,

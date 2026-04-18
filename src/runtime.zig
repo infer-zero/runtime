@@ -1,8 +1,8 @@
 //! Inference driver: owns a per-conversation `Context`, a `Tokenizer` for
 //! text↔token conversion, and a `Sampler` for logits→token selection. Takes
-//! a borrowed `*Inference` plus a borrowed `*const Info`; knows nothing about
-//! chat templates, special tokens, or tool calls. Those all belong to
-//! `Model` / `ChatSession` sitting above.
+//! a borrowed `*Inference` plus the model's `vocabulary_size`/`max_len`;
+//! knows nothing about chat templates, special tokens, or tool calls. Those
+//! all belong to `Model` / `ChatSession` sitting above.
 //!
 //! Callers that want raw completion construct a `Runtime` directly from a
 //! `Model` (via `Runtime.init`) and use `Context.prefill` + `Context.next` in
@@ -11,7 +11,7 @@
 
 allocator: std.mem.Allocator,
 inference: *Inference,
-info: *const Info,
+vocabulary_size: usize,
 tokenizer: Tokenizer,
 sampler: Sampler,
 max_len: usize,
@@ -31,10 +31,10 @@ pub fn init(allocator: std.mem.Allocator, model: *Model, options: Options) @This
     return .{
         .allocator = allocator,
         .inference = &model.inference,
-        .info = &model.info,
+        .vocabulary_size = model.vocabulary_size,
         .tokenizer = Tokenizer.init(vocab),
         .sampler = Sampler.init(options.sampler_options),
-        .max_len = options.max_len orelse model.info.max_len,
+        .max_len = options.max_len orelse model.max_len,
     };
 }
 
@@ -60,7 +60,7 @@ pub const Context = struct {
         const context = try runtime.inference.createContext();
         errdefer runtime.inference.destroyContext(context);
 
-        const logits_buf = try runtime.allocator.alloc(f32, runtime.info.vocabulary_size);
+        const logits_buf = try runtime.allocator.alloc(f32, runtime.vocabulary_size);
         errdefer runtime.allocator.free(logits_buf);
 
         return .{
@@ -157,4 +157,3 @@ const Tokenizer = @import("tokenizer.zig");
 const Sampler = @import("sampler.zig");
 const Model = @import("model.zig");
 const Inference = @import("inference.zig");
-const Info = @import("info.zig");
