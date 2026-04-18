@@ -362,4 +362,91 @@ test "repetition penalty" {
     try std.testing.expectEqual(@as(TokenID, 2), token2);
 }
 
+// Regression: a token appearing N times in history must be penalized
+// ONCE (per-unique semantics), not N times. The earlier per-occurrence
+// implementation crushed common tokens (spaces, punctuation) with
+// `logit / penalty^N` on long contexts and produced the multilingual
+// drift on Qwen3-4B at rep=1.1. The penalty (2.0) is small enough that
+// per-unique leaves token 1 above token 2 (5/2 = 2.5 > 2.0); the
+// per-occurrence broken behavior would compound it across the 50
+// repeats to (5/2^50 ≪ 2.0) and pick token 2.
+test "repetition penalty: per-unique, not per-occurrence" {
+    var opts = Options.default;
+    opts.temperature = 0.0;
+    opts.repetition_penalty = 2.0;
+    opts.repetition_penalty_last_n = 64;
+    var sampler = init(opts);
+    const logits = [_]f32{ 1.0, 5.0, 2.0, 0.5 };
+
+    // History has token 1 repeated 50 times. Per-unique penalty: 5/2 = 2.5
+    // (still highest). Per-occurrence (broken): 5/2^50 ≈ 0 (token 2 wins).
+    var history: [50]TokenID = undefined;
+    for (&history) |*h| h.* = 1;
+
+    var logits_copy = logits;
+    const token = sampler.sample(&logits_copy, &history);
+    try std.testing.expectEqual(@as(TokenID, 1), token);
+}
+
+// Regression: tokens older than `repetition_penalty_last_n` must NOT
+// be penalized. Without windowing, an old prompt occurrence of a token
+// would still count against it many decode steps later, which compounds
+// over long contexts.
+test "repetition penalty: last_n window excludes old history" {
+    var opts = Options.default;
+    opts.temperature = 0.0;
+    opts.repetition_penalty = 100.0;
+    opts.repetition_penalty_last_n = 4;
+    var sampler = init(opts);
+    const logits = [_]f32{ 1.0, 5.0, 4.9, 0.5 };
+
+    // Token 1 appears at history[0], window is last 4 → only history[1..5]
+    // is considered. Token 1 is OUT of window, so no penalty. Argmax = 1.
+    const history = [_]TokenID{ 1, 2, 3, 0, 2 };
+    var logits_copy = logits;
+    const token = sampler.sample(&logits_copy, &history);
+    try std.testing.expectEqual(@as(TokenID, 1), token);
+}
+
+// Regression: negative-logit branch (multiply instead of divide). The
+// original sampler uses asymmetric penalty — positive logits divide,
+// negative logits multiply (push further from zero). Per-unique must
+// apply that branch correctly too, not silently fall back to per-occurrence.
+test "repetition penalty: negative logits scaled per-unique" {
+    var opts = Options.default;
+    opts.temperature = 0.0;
+    opts.repetition_penalty = 2.0;
+    opts.repetition_penalty_last_n = 64;
+    var sampler = init(opts);
+
+    // Token 0 starts negative; per-unique penalty: -1.0 * 2.0 = -2.0
+    // (pushes further negative). Per-occurrence (broken) over 10 repeats:
+    // -1.0 * 2.0^10 = -1024 (would be the same direction but extreme).
+    // Token 1 is positive 1.5 — argmax = 1 either way.
+    // To distinguish per-unique from per-occurrence cleanly, check the
+    // penalized logit is exactly -2.0 (not -1024).
+    const history = [_]TokenID{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    var logits = [_]f32{ -1.0, 1.5, 0.0 };
+    _ = sampler.sample(&logits, &history);
+    try std.testing.expectApproxEqAbs(@as(f32, -2.0), logits[0], 0.001);
+}
+
+// Out-of-range token IDs in history must be silently skipped (vocab
+// expansion across model versions can leave stale token IDs above the
+// current logits.len in serialized history).
+test "repetition penalty: ignores out-of-range token ids" {
+    var opts = Options.default;
+    opts.temperature = 0.0;
+    opts.repetition_penalty = 100.0;
+    var sampler = init(opts);
+    const logits = [_]f32{ 1.0, 5.0, 4.9, 0.5 };
+
+    // history[0] is out of range; without skip we'd read OOB / panic.
+    const history = [_]TokenID{ 9999, 1 };
+    var logits_copy = logits;
+    const token = sampler.sample(&logits_copy, &history);
+    // Token 1 still penalized (in range), so token 2 wins.
+    try std.testing.expectEqual(@as(TokenID, 2), token);
+}
+
 const std = @import("std");
