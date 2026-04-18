@@ -2,7 +2,6 @@ pub const Tensor = @import("tensor.zig");
 pub const Vocabulary = @import("vocabulary.zig");
 pub const Tokenizer = @import("tokenizer.zig");
 pub const Sampler = @import("sampler.zig");
-pub const Meta = @import("meta.zig");
 pub const Inference = @import("inference.zig");
 pub const Chat = @import("chat.zig");
 pub const Tool = @import("tool.zig");
@@ -24,7 +23,6 @@ test {
     _ = Vocabulary;
     _ = Tokenizer;
     _ = Sampler;
-    _ = Meta;
     _ = Inference;
     _ = Chat;
     _ = Tool;
