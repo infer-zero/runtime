@@ -14,6 +14,13 @@ pub const Options = struct {
     top_p: f32, // Nucleus sampling: keep smallest set of tokens with cumulative prob >= top_p (1.0 = disabled)
     min_p: f32, // Keep tokens with prob >= min_p * max_prob (0.0 = disabled)
     repetition_penalty: f32, // 1.0 = no penalty, >1.0 = penalize repetition
+    /// Window over which the repetition penalty looks back. Matches
+    /// llama.cpp's `repeat_last_n` default. Penalty is applied once per
+    /// UNIQUE token in this window (not per occurrence) — without this,
+    /// common tokens like " " accumulate penalty^N where N is their
+    /// count in history, which crushes them on long contexts and produces
+    /// the multilingual / missing-space drift we observed at rep=1.1.
+    repetition_penalty_last_n: u32,
     seed: ?u64,
 
     pub const default: @This() = .{
@@ -22,6 +29,7 @@ pub const Options = struct {
         .top_p = 0.95,
         .min_p = 0.05,
         .repetition_penalty = 1.1,
+        .repetition_penalty_last_n = 64,
         .seed = null,
     };
 };
@@ -42,17 +50,36 @@ pub fn sample(
     logits: []f32,
     history: []const TokenID,
 ) TokenID {
-    // Apply repetition penalty to recently generated tokens
-    if (self.options.repetition_penalty != 1.0) {
-        for (history) |token_id| {
-            if (token_id < logits.len) {
-                const logit = logits[token_id];
-                // Standard repetition penalty: divide positive logits, multiply negative
-                if (logit > 0) {
-                    logits[token_id] = logit / self.options.repetition_penalty;
-                } else {
-                    logits[token_id] = logit * self.options.repetition_penalty;
+    // Apply repetition penalty ONCE per unique token in the last
+    // `repetition_penalty_last_n` history positions. Matches llama.cpp's
+    // semantics. The earlier implementation iterated all history and
+    // applied per-occurrence, so common tokens (spaces, punctuation) got
+    // logit / penalty^count and were crushed below alternatives — which
+    // surfaced as multilingual / missing-space drift on long-context
+    // generation, especially at higher penalty values like 1.1.
+    if (self.options.repetition_penalty != 1.0 and history.len > 0) {
+        const last_n = @as(usize, self.options.repetition_penalty_last_n);
+        const start = if (history.len > last_n) history.len - last_n else 0;
+        const window = history[start..];
+
+        for (window, 0..) |token_id, i| {
+            if (token_id >= logits.len) continue;
+            // Skip if this token was already penalized earlier in the window.
+            // O(N^2) over the window (default N=64 → 4096 ops/sample);
+            // negligible vs. the model forward pass.
+            var already_seen = false;
+            for (window[0..i]) |earlier| {
+                if (earlier == token_id) {
+                    already_seen = true;
+                    break;
                 }
+            }
+            if (already_seen) continue;
+            const logit = logits[token_id];
+            if (logit > 0) {
+                logits[token_id] = logit / self.options.repetition_penalty;
+            } else {
+                logits[token_id] = logit * self.options.repetition_penalty;
             }
         }
     }
