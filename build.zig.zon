@@ -1,6 +1,6 @@
 .{
-    .name = .infer_base,
-    .fingerprint = 0x888a0229f2f70a72,
+    .name = .infer_runtime,
+    .fingerprint = 0xd24763512e0070c6,
     .version = "0.1.0",
     .minimum_zig_version = "0.15.2",
     .dependencies = .{},

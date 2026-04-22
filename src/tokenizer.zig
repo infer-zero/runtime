@@ -1,31 +1,27 @@
-//! BPE Tokenizer for text encoding/decoding.
-//!
-//! Provides encode/decode functionality using vocabulary data loaded by readers.
+//! BPE Tokenizer for text encoding/decoding, plus the `Vocabulary` data it
+//! operates on (nested below). Every `Model` owns one `Tokenizer`, built from
+//! the `Vocabulary` loaded by the variant.
 
 const log = std.log.scoped(.infer);
 
 const std = @import("std");
-const Vocabulary = @import("vocabulary.zig");
-
-const TokenID = Vocabulary.TokenID;
 
 const MetaSpace: []const u8 = "▁";
 
-// Main tokenizer struct fields
 vocabulary: Vocabulary,
 
-const Self = @This();
+const Tokenizer = @This();
+
+pub const TokenID = u32;
 
 /// Initialize tokenizer with vocabulary data.
-/// The vocabulary pointer must remain valid for the lifetime of the tokenizer.
-pub fn init(vocabulary: Vocabulary) Self {
-    return Self{
-        .vocabulary = vocabulary,
-    };
+/// The vocabulary's backing storage must remain valid for the tokenizer's lifetime.
+pub fn init(vocabulary: Vocabulary) Tokenizer {
+    return .{ .vocabulary = vocabulary };
 }
 
 /// Decode tokens to text
-pub fn decode(self: Self, allocator: std.mem.Allocator, tokens: []const TokenID) ![]const u8 {
+pub fn decode(self: Tokenizer, allocator: std.mem.Allocator, tokens: []const TokenID) ![]const u8 {
     var text: std.ArrayListUnmanaged(u8) = .{};
 
     for (tokens) |token| {
@@ -62,12 +58,12 @@ pub fn decode(self: Self, allocator: std.mem.Allocator, tokens: []const TokenID)
 }
 
 /// Decode a single token (returns raw form)
-pub fn decodeToken(self: Self, token: TokenID) []const u8 {
+pub fn decodeToken(self: Tokenizer, token: TokenID) []const u8 {
     return self.vocabulary.decoding.get(token) orelse "";
 }
 
 /// Encode text to tokens
-pub fn encode(self: Self, allocator: std.mem.Allocator, input: []const u8) ![]const TokenID {
+pub fn encode(self: Tokenizer, allocator: std.mem.Allocator, input: []const u8) ![]const TokenID {
     const special_sorted = self.vocabulary.special_tokens_sorted;
 
     var result = std.ArrayListUnmanaged(TokenID){};
@@ -142,7 +138,7 @@ fn splitOnSpecialTokens(
     }
 }
 
-fn encodeRegularText(self: Self, allocator: std.mem.Allocator, input: []const u8, result: *std.ArrayListUnmanaged(TokenID)) !void {
+fn encodeRegularText(self: Tokenizer, allocator: std.mem.Allocator, input: []const u8, result: *std.ArrayListUnmanaged(TokenID)) !void {
     if (input.len == 0) return;
 
     const normalized = if (self.vocabulary.normalizer) |normalizer|
@@ -175,7 +171,7 @@ fn encodeRegularText(self: Self, allocator: std.mem.Allocator, input: []const u8
     }
 }
 
-fn splitAndMerge(self: Self, arena: std.mem.Allocator, input: []const u8) ![]const []const u8 {
+fn splitAndMerge(self: Tokenizer, arena: std.mem.Allocator, input: []const u8) ![]const []const u8 {
     var subwords = std.ArrayListUnmanaged([]const u8){};
 
     const utf8_view = std.unicode.Utf8View.init(input) catch unreachable;
@@ -385,6 +381,62 @@ fn sentencePiecePreprocess(allocator: std.mem.Allocator, input: []const u8) ![]u
     return result.toOwnedSlice(allocator);
 }
 
+/// Raw tokenizer data: merge tables, encoding/decoding maps, normalizer/
+/// post-processor, special-token registry, and the designated EOS token.
+/// Produced by the variant's loader (HuggingFace or GGUF) and passed to
+/// `Tokenizer.init`. The *semantic* interpretation of special tokens
+/// (end-of-turn, thinking markers, tool-call framing) lives on `Chat`, not
+/// here — this struct is just the tokenizer's data.
+pub const Vocabulary = struct {
+    merge_index: MergePairIndex,
+    encoding: EncodingVocabulary,
+    decoding: DecodingVocabulary,
+
+    unknown_token: ?[]const u8 = null,
+    normalizer: ?Normalizer = null,
+    post_processor: ?PostProcessor = null,
+    use_byte_level: bool = false,
+
+    special_tokens: SpecialTokens = .empty,
+    special_tokens_sorted: []const SpecialTokenEntry = &.{},
+
+    /// The vocabulary's designated end-of-sequence token. Raw completion
+    /// stops on this; `Chat` uses it as a fallback when its chat-specific
+    /// end-of-turn markers aren't set. Defaults to 0 — variants/adapters
+    /// must populate it from the parsed tokenizer config at load time.
+    eos_token_id: TokenID = 0,
+
+    pub const Subword = []const u8;
+    pub const MergePairIndex = std.StringHashMapUnmanaged(usize);
+    pub const EncodingVocabulary = std.StringHashMapUnmanaged(TokenID);
+    pub const DecodingVocabulary = std.AutoHashMapUnmanaged(TokenID, Subword);
+    pub const SpecialTokens = std.StringHashMapUnmanaged(TokenID);
+
+    pub const SpecialTokenEntry = struct {
+        text: []const u8,
+        id: TokenID,
+    };
+
+    pub const Normalizer = union(enum) {
+        sequence: []const Normalizer,
+        prepend: []const u8,
+        replace: struct {
+            pattern: []const u8,
+            content: []const u8,
+        },
+    };
+
+    pub const PostProcessor = union(enum) {
+        sequence: []const PostProcessor,
+        template: []const TemplateProcessing,
+
+        pub const TemplateProcessing = union(enum) {
+            sequence: void,
+            special_token: TokenID,
+        };
+    };
+};
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -428,17 +480,11 @@ fn createTestVocabulary(allocator: std.mem.Allocator) !Vocabulary {
 
     // Merge pairs with priority (lower index = higher priority)
     var merge_index: Vocabulary.MergePairIndex = .{};
-    // "h" + "e" -> "he" (priority 0)
     try merge_index.put(allocator, "h\x00e", 0);
-    // "l" + "l" -> "ll" (priority 1)
     try merge_index.put(allocator, "l\x00l", 1);
-    // "l" + "o" -> "lo" (priority 2)
     try merge_index.put(allocator, "l\x00o", 2);
-    // "he" + "l" -> "hel" (priority 3)
     try merge_index.put(allocator, "he\x00l", 3);
-    // "hel" + "lo" -> "hello" (priority 4)
     try merge_index.put(allocator, "hel\x00lo", 4);
-    // MetaSpace merges
     try merge_index.put(allocator, MetaSpace ++ "\x00h", 5);
     try merge_index.put(allocator, MetaSpace ++ "h\x00e", 6);
     try merge_index.put(allocator, MetaSpace ++ "he\x00l", 7);
@@ -450,6 +496,7 @@ fn createTestVocabulary(allocator: std.mem.Allocator) !Vocabulary {
         .decoding = decoding,
         .unknown_token = "<unk>",
         .use_byte_level = false,
+        .eos_token_id = 0,
     };
 }
 
@@ -464,7 +511,7 @@ test "decodeToken returns token string" {
     var vocab = try createTestVocabulary(allocator);
     defer cleanupTestVocabulary(allocator, &vocab);
 
-    const tokenizer = Self.init(vocab);
+    const tokenizer = Tokenizer.init(vocab);
 
     try testing.expectEqualStrings("hello", tokenizer.decodeToken(8));
     try testing.expectEqualStrings("he", tokenizer.decodeToken(4));
@@ -476,7 +523,7 @@ test "decode converts tokens to text" {
     var vocab = try createTestVocabulary(allocator);
     defer cleanupTestVocabulary(allocator, &vocab);
 
-    const tokenizer = Self.init(vocab);
+    const tokenizer = Tokenizer.init(vocab);
 
     const tokens = [_]TokenID{8}; // "hello"
     const text = try tokenizer.decode(allocator, &tokens);
@@ -490,7 +537,7 @@ test "decode handles multiple tokens" {
     var vocab = try createTestVocabulary(allocator);
     defer cleanupTestVocabulary(allocator, &vocab);
 
-    const tokenizer = Self.init(vocab);
+    const tokenizer = Tokenizer.init(vocab);
 
     const tokens = [_]TokenID{ 4, 5, 3 }; // "he" + "ll" + "o"
     const text = try tokenizer.decode(allocator, &tokens);
@@ -502,9 +549,6 @@ test "decode handles multiple tokens" {
 test "encode tokenizes text using BPE merges" {
     const allocator = testing.allocator;
 
-    // Vocabulary with character-level tokens and merge rules
-    // Input "ab" after preprocess becomes "▁ab"
-    // Merges: "a" + "b" -> "ab" (priority 0)
     var encoding: Vocabulary.EncodingVocabulary = .{};
     try encoding.put(allocator, MetaSpace, 0);
     try encoding.put(allocator, "a", 1);
@@ -520,7 +564,7 @@ test "encode tokenizes text using BPE merges" {
     defer decoding.deinit(allocator);
 
     var merge_index: Vocabulary.MergePairIndex = .{};
-    try merge_index.put(allocator, "a\x00b", 0); // "a" + "b" -> "ab"
+    try merge_index.put(allocator, "a\x00b", 0);
     defer merge_index.deinit(allocator);
 
     const vocab = Vocabulary{
@@ -528,17 +572,14 @@ test "encode tokenizes text using BPE merges" {
         .encoding = encoding,
         .decoding = decoding,
         .use_byte_level = false,
+        .eos_token_id = 0,
     };
 
-    const tokenizer = Self.init(vocab);
+    const tokenizer = Tokenizer.init(vocab);
 
     const tokens = try tokenizer.encode(allocator, "ab");
     defer allocator.free(tokens);
 
-    // After sentencePiecePreprocess: "▁ab"
-    // Split into: ["▁", "a", "b"]
-    // Merge "a" + "b" -> "ab"
-    // Result: ["▁", "ab"] -> tokens [0, 3]
     try testing.expectEqual(@as(usize, 2), tokens.len);
     try testing.expectEqual(@as(TokenID, 0), tokens[0]); // ▁
     try testing.expectEqual(@as(TokenID, 3), tokens[1]); // ab
@@ -549,13 +590,11 @@ test "encode handles unknown tokens" {
     var vocab = try createTestVocabulary(allocator);
     defer cleanupTestVocabulary(allocator, &vocab);
 
-    const tokenizer = Self.init(vocab);
+    const tokenizer = Tokenizer.init(vocab);
 
     const tokens = try tokenizer.encode(allocator, "x");
     defer allocator.free(tokens);
 
-    // After sentencePiecePreprocess: "▁x"
-    // Neither "▁" nor "x" are in vocab, so both become unknown tokens
     try testing.expectEqual(@as(usize, 2), tokens.len);
     try testing.expectEqual(@as(TokenID, 9), tokens[0]); // <unk> for ▁
     try testing.expectEqual(@as(TokenID, 9), tokens[1]); // <unk> for x
@@ -566,23 +605,20 @@ test "encode works without unknown token when all chars in vocab" {
     var vocab = try createTestVocabulary(allocator);
     defer cleanupTestVocabulary(allocator, &vocab);
 
-    // Add the missing characters so encoding succeeds without unknown_token
     try vocab.encoding.put(allocator, MetaSpace, 14);
     try vocab.encoding.put(allocator, "x", 15);
     try vocab.decoding.put(allocator, 14, MetaSpace);
     try vocab.decoding.put(allocator, 15, "x");
 
     vocab.unknown_token = null;
-    const tokenizer = Self.init(vocab);
+    const tokenizer = Tokenizer.init(vocab);
 
     const tokens = try tokenizer.encode(allocator, "x");
     defer allocator.free(tokens);
 
-    // After sentencePiecePreprocess: "▁x"
-    // Split into: ["▁", "x"] (no merge rule for these)
     try testing.expectEqual(@as(usize, 2), tokens.len);
-    try testing.expectEqual(@as(TokenID, 14), tokens[0]); // ▁
-    try testing.expectEqual(@as(TokenID, 15), tokens[1]); // x
+    try testing.expectEqual(@as(TokenID, 14), tokens[0]);
+    try testing.expectEqual(@as(TokenID, 15), tokens[1]);
 }
 
 test "encode empty string returns empty" {
@@ -590,7 +626,7 @@ test "encode empty string returns empty" {
     var vocab = try createTestVocabulary(allocator);
     defer cleanupTestVocabulary(allocator, &vocab);
 
-    const tokenizer = Self.init(vocab);
+    const tokenizer = Tokenizer.init(vocab);
 
     const tokens = try tokenizer.encode(allocator, "");
     defer allocator.free(tokens);
@@ -605,7 +641,6 @@ test "ByteLevelTable roundtrip" {
     const encoded = try ByteLevelTable.encode(allocator, input);
     defer allocator.free(encoded);
 
-    // Encoded should be different (uses unicode codepoints for some bytes)
     try testing.expect(encoded.len >= input.len);
 }
 
@@ -615,7 +650,6 @@ test "sentencePiecePreprocess adds meta space" {
     const result = try sentencePiecePreprocess(allocator, "hello world");
     defer allocator.free(result);
 
-    // Should start with MetaSpace and have MetaSpace before "world"
     try testing.expect(std.mem.startsWith(u8, result, MetaSpace));
     try testing.expect(std.mem.indexOf(u8, result[MetaSpace.len..], MetaSpace) != null);
 }
@@ -627,7 +661,6 @@ test "sentencePiecePreprocess handles already prefixed input" {
     const result = try sentencePiecePreprocess(allocator, input);
     defer allocator.free(result);
 
-    // Should not double-prefix
     try testing.expectEqualStrings(input, result);
 }
 
@@ -647,9 +680,10 @@ test "decode handles MetaSpace as regular space" {
         .encoding = encoding,
         .decoding = decoding,
         .use_byte_level = false,
+        .eos_token_id = 0,
     };
 
-    const tokenizer = Self.init(vocab);
+    const tokenizer = Tokenizer.init(vocab);
 
     const tokens = [_]TokenID{0};
     const text = try tokenizer.decode(allocator, &tokens);
@@ -682,9 +716,9 @@ test "postProcess with template adds special tokens" {
     const allocator = testing.allocator;
 
     const template = [_]Vocabulary.PostProcessor.TemplateProcessing{
-        .{ .special_token = 100 }, // BOS
+        .{ .special_token = 100 },
         .{ .sequence = {} },
-        .{ .special_token = 101 }, // EOS
+        .{ .special_token = 101 },
     };
     const post_processor = Vocabulary.PostProcessor{ .template = &template };
 
@@ -701,8 +735,6 @@ test "postProcess with template adds special tokens" {
 }
 
 test "vocabulary works without merge_pairs field" {
-    // This test verifies that only merge_index is needed for BPE,
-    // not the merge_pairs slice
     const allocator = testing.allocator;
 
     var encoding: Vocabulary.EncodingVocabulary = .{};
@@ -721,20 +753,19 @@ test "vocabulary works without merge_pairs field" {
     try merge_index.put(allocator, "a\x00b", 0);
     defer merge_index.deinit(allocator);
 
-    // No merge_pairs needed - only merge_index is used by tokenizer
     const vocab = Vocabulary{
         .merge_index = merge_index,
         .encoding = encoding,
         .decoding = decoding,
-        .use_byte_level = true, // bypass sentencePiecePreprocess
+        .use_byte_level = true,
+        .eos_token_id = 0,
     };
 
-    const tokenizer = Self.init(vocab);
+    const tokenizer = Tokenizer.init(vocab);
 
     const tokens = try tokenizer.encode(allocator, "ab");
     defer allocator.free(tokens);
 
-    // "ab" -> ByteLevel encode -> split to chars -> merge "a"+"b" -> "ab" -> token 2
     try testing.expectEqual(@as(usize, 1), tokens.len);
-    try testing.expectEqual(@as(Vocabulary.TokenID, 2), tokens[0]);
+    try testing.expectEqual(@as(TokenID, 2), tokens[0]);
 }

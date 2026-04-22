@@ -1,215 +1,38 @@
-//! Aggregate handle that composes a model's pure data, its tight inference
-//! core (`Inference`), and optional capabilities (`Chat`, `Tool`). Each
-//! variant's `load()` function constructs one of these by wiring its concrete
-//! implementation into an `Inference` and attaching whichever optional
-//! features it supports.
+//! Aggregate view over a loaded variant. Three pieces, all borrowed:
+//!   - `tokenizer`: wraps the variant's `Vocabulary` (merges, encoding/
+//!                  decoding maps, designated `eos_token_id`)
+//!   - `engine`:    pointer to the variant's embedded `Engine` (metadata +
+//!                  `createContext` factory)
+//!   - `chat`:      optional `ChatSession.Chat` overlay (with optional
+//!                  nested `Tool`) — holder only; `ChatSession` is the
+//!                  actual consumer.
 //!
-//! Cross-cutting features (chat, tool-calling, eventually speculative
-//! decoding / grammar / LoRA / …) become new optional fields on this struct
-//! plus variant opt-in — no edits to unrelated variants, no base VTable
-//! changes.
+//! Model is a **view**, not an owner. It has no `deinit` and no factory
+//! methods. The caller that constructed the concrete variant (e.g.
+//! `var v = try MyVariant.load(...);`) owns the variant's lifecycle and
+//! calls the variant's own deinit when done. Contexts are created by
+//! calling `model.engine.createContext(...)`, which returns a `*Context`
+//! pointing into a variant-specific `ConcreteContext` wrapper the
+//! factory heap-allocated. Comptime-aware callers own the wrapper via
+//! `@fieldParentPtr`; polymorphic borrowers (ChatSession) just use the
+//! `*Context` and do not deinit.
 
-eos_token_id: u32,
-vocabulary_size: usize,
-max_len: usize,
-special_tokens: SpecialTokens = .{},
-inference: Inference,
+tokenizer: Tokenizer,
+engine: *Engine,
 chat: ?Chat = null,
-tool: ?Tool = null,
 
 const Model = @This();
 
-pub fn deinit(self: *Model) void {
-    self.inference.deinit();
+/// True iff `token` ends a turn in this model. Raw-completion callers
+/// stop on the vocabulary's designated EOS; chat-capable models may also
+/// emit distinct end-of-turn markers (Qwen's `<|im_end|>`, Llama 3's
+/// `<|eot_id|>`) which `Chat.isEndOfTurn` knows about.
+pub fn isEndOfTurn(self: *const Model, token: u32) bool {
+    if (token == self.tokenizer.vocabulary.eos_token_id) return true;
+    if (self.chat) |c| return c.isEndOfTurn(token);
+    return false;
 }
 
-pub fn vocabulary(self: *Model) Vocabulary {
-    return self.inference.vocabulary();
-}
-
-pub fn createContext(self: *Model) !*anyopaque {
-    return try self.inference.createContext();
-}
-
-pub fn destroyContext(self: *Model, ctx: *anyopaque) void {
-    self.inference.destroyContext(ctx);
-}
-
-pub fn prefill(self: *Model, ctx: *anyopaque, tokens: []const u32) !void {
-    try self.inference.prefill(ctx, tokens);
-}
-
-pub fn next(self: *Model, ctx: *anyopaque, token: u32) ![]const f32 {
-    return try self.inference.next(ctx, token);
-}
-
-/// Classify a token via pure data lookup on `self.special_tokens`. Falls
-/// back to matching `eos_token_id` so models that only populate
-/// `eos_token_id` (and leave `special_tokens` defaulted) still see EOS as
-/// `.end_of_turn`.
-pub fn classifyToken(self: *const Model, token: u32) TokenClass {
-    const st = self.special_tokens;
-    if (st.thinking_start) |id| if (token == id) return .thinking_start;
-    if (st.thinking_end) |id| if (token == id) return .thinking_end;
-    if (st.tool_call_start) |id| if (token == id) return .tool_call_start;
-    if (st.tool_call_end) |id| if (token == id) return .tool_call_end;
-    if (st.end_of_turn) |id| if (token == id) return .end_of_turn;
-    if (st.end_of_turn_alt) |id| if (token == id) return .end_of_turn;
-    if (token == self.eos_token_id) return .end_of_turn;
-    return .content;
-}
-
-/// Generic factory: construct the aggregate `Model` for a concrete variant
-/// type `T` by calling `T.init(allocator, path)`, type-erasing it into an
-/// `Inference`, and lifting the `Chat` piece reflected from `T`'s public
-/// surface.
-///
-/// Required on `T`:
-///   - `pub fn init(Allocator, []const u8) !*T`
-///   - the six inference methods (`deinit`, `vocabulary`, `createContext`,
-///     `destroyContext`, `prefill`, `next`) on `*T` with a `T.Context` type.
-///   - `eos_token_id: u32` field.
-///   - `config: *` field with `vocabulary_size: usize` and `max_len: usize`
-///     sub-fields (matches every existing variant).
-///
-/// Optional on `T`:
-///   - `special_tokens: SpecialTokens` field (defaulted if absent).
-///   - `pub fn formatSystem(Allocator, ChatOptions) ![]const u8`
-///   - `pub fn formatMessage(Allocator, Message, MessageFormat) ![]const u8`
-///   - `pub const end_of_turn_suffix: []const u8`
-///
-/// When both `formatSystem` and `formatMessage` are present, a `Chat` is
-/// attached; otherwise `model.chat = null`. `tool` is always null at the
-/// moment — variants that want native tool-call handling will grow an
-/// analogous opt-in.
-pub fn init(comptime T: type, allocator: std.mem.Allocator, path: []const u8) !Model {
-    const concrete = try T.init(allocator, path);
-
-    const special_tokens: SpecialTokens = if (@hasField(T, "special_tokens"))
-        concrete.special_tokens
-    else
-        .{};
-
-    const chat: ?Chat = if (@hasDecl(T, "formatSystem") and @hasDecl(T, "formatMessage"))
-        .{
-            .formatSystem = T.formatSystem,
-            .formatMessage = T.formatMessage,
-            .end_of_turn_suffix = if (@hasDecl(T, "end_of_turn_suffix")) T.end_of_turn_suffix else "",
-        }
-    else
-        null;
-
-    if (chat != null) validateSpecialTokens(special_tokens);
-
-    return .{
-        .eos_token_id = concrete.eos_token_id,
-        .vocabulary_size = concrete.config.vocabulary_size,
-        .max_len = concrete.config.max_len,
-        .special_tokens = special_tokens,
-        .inference = Inference.wrap(T).init(concrete).inference(),
-        .chat = chat,
-        .tool = null,
-    };
-}
-
-/// Warn at init time about special-token misconfigurations that are easy to
-/// introduce (wrong token string, missing end marker) but hard to debug at
-/// runtime because the failure mode is silent (null lookup → feature disabled).
-fn validateSpecialTokens(st: SpecialTokens) void {
-    const stderr = std.fs.File.stderr();
-
-    // Warn about unpaired start/end markers.
-    if (st.thinking_start != null and st.thinking_end == null)
-        stderr.writeAll("warning: thinking_start is set but thinking_end is null — thinking mode will not terminate cleanly\n") catch {};
-    if (st.thinking_end != null and st.thinking_start == null)
-        stderr.writeAll("warning: thinking_end is set but thinking_start is null — thinking blocks will never begin\n") catch {};
-    if (st.tool_call_start != null and st.tool_call_end == null)
-        stderr.writeAll("warning: tool_call_start is set but tool_call_end is null — tool calls will never be committed\n") catch {};
-    if (st.tool_call_end != null and st.tool_call_start == null)
-        stderr.writeAll("warning: tool_call_end is set but tool_call_start is null — tool call phase will never begin\n") catch {};
-
-    // Warn when no tool call tokens were found. Most models with chat support
-    // should have these — a null lookup usually means the token string in the
-    // variant's init doesn't match the tokenizer (e.g. <|tool_call|> vs <tool_call>).
-    if (st.tool_call_start == null and st.tool_call_end == null)
-        stderr.writeAll("warning: no tool_call_start/tool_call_end tokens found — tool calling will be disabled\n") catch {};
-}
-
-/// Re-exports of chat-adjacent types. Variants import them as
-/// `@import("base").Model.ChatOptions` etc.; keeping these aliases avoids
-/// churning every variant's import list.
-pub const ChatOptions = Chat.ChatOptions;
-pub const MessageFormat = Chat.MessageFormat;
-
-/// Per-model semantic special-token IDs. Populated by each variant at init
-/// time from tokenizer lookups; consumed by `classifyToken` + `ChatSession`.
-/// All fields are `?u32`; null means "this model doesn't use that token
-/// class." `end_of_turn_alt` covers the second EOT some models have (Qwen
-/// uses `<|im_end|>` + `<|end_of_text|>`; Llama 3 uses `<|eot_id|>` +
-/// `<|end_of_text|>`; most other models have just one).
-pub const SpecialTokens = struct {
-    end_of_turn: ?u32 = null,
-    end_of_turn_alt: ?u32 = null,
-    thinking_start: ?u32 = null,
-    thinking_end: ?u32 = null,
-    tool_call_start: ?u32 = null,
-    tool_call_end: ?u32 = null,
-};
-
-/// Semantic classes used by `ChatSession` to drive its streaming state
-/// machine.
-pub const TokenClass = enum {
-    content,
-    thinking_start,
-    thinking_end,
-    tool_call_start,
-    tool_call_end,
-    end_of_turn,
-};
-
-const Inference = @import("inference.zig");
-const Chat = @import("chat.zig");
-const Tool = @import("tool.zig");
-const Vocabulary = @import("vocabulary.zig");
-
-const std = @import("std");
-const testing = std.testing;
-
-test "classifyToken uses data path with eos fallback" {
-    var m: Model = .{
-        .eos_token_id = 99,
-        .vocabulary_size = 0,
-        .max_len = 0,
-        .special_tokens = .{
-            .end_of_turn = 1,
-            .end_of_turn_alt = 2,
-            .thinking_start = 10,
-            .thinking_end = 11,
-            .tool_call_start = 20,
-            .tool_call_end = 21,
-        },
-        .inference = undefined,
-    };
-
-    try testing.expectEqual(TokenClass.end_of_turn, m.classifyToken(1));
-    try testing.expectEqual(TokenClass.end_of_turn, m.classifyToken(2));
-    try testing.expectEqual(TokenClass.thinking_start, m.classifyToken(10));
-    try testing.expectEqual(TokenClass.thinking_end, m.classifyToken(11));
-    try testing.expectEqual(TokenClass.tool_call_start, m.classifyToken(20));
-    try testing.expectEqual(TokenClass.tool_call_end, m.classifyToken(21));
-    try testing.expectEqual(TokenClass.content, m.classifyToken(50));
-    // eos fallback when special_tokens doesn't enumerate it.
-    try testing.expectEqual(TokenClass.end_of_turn, m.classifyToken(99));
-}
-
-test "classifyToken with empty special_tokens falls back to eos only" {
-    var m: Model = .{
-        .eos_token_id = 2,
-        .vocabulary_size = 0,
-        .max_len = 0,
-        .inference = undefined,
-    };
-
-    try testing.expectEqual(TokenClass.end_of_turn, m.classifyToken(2));
-    try testing.expectEqual(TokenClass.content, m.classifyToken(0));
-}
+const Tokenizer = @import("tokenizer.zig");
+const Engine = @import("engine.zig");
+const Chat = @import("chat_session.zig").Chat;
