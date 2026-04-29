@@ -36,6 +36,7 @@ pub const VTable = struct {
     /// the file docstring for the ownership contract.
     createContext: *const fn (
         *Engine,
+        std.Io,
         std.mem.Allocator,
         Tokenizer,
         Context.Options,
@@ -44,11 +45,12 @@ pub const VTable = struct {
 
 pub fn createContext(
     self: *Engine,
+    io: std.Io,
     allocator: std.mem.Allocator,
     tokenizer: Tokenizer,
     options: Context.Options,
 ) !*Context {
-    return try self.vtable.createContext(self, allocator, tokenizer, options);
+    return try self.vtable.createContext(self, io, allocator, tokenizer, options);
 }
 
 const std = @import("std");

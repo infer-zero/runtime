@@ -34,8 +34,12 @@ pub const Options = struct {
     };
 };
 
-pub fn init(options: Options) @This() {
-    const seed = options.seed orelse @as(u64, @bitCast(std.time.microTimestamp()));
+pub fn init(io: std.Io, options: Options) @This() {
+    const seed = options.seed orelse blk: {
+        var seed_bytes: [8]u8 = undefined;
+        io.random(&seed_bytes);
+        break :blk std.mem.readInt(u64, &seed_bytes, .little);
+    };
     return .{
         .options = options,
         .rng = std.Random.DefaultPrng.init(seed),
@@ -297,7 +301,7 @@ test "softmax produces valid distribution" {
 test "greedy sampling" {
     var opts = Options.default;
     opts.temperature = 0.0;
-    var sampler = init(opts);
+    var sampler = init(std.testing.io, opts);
     var logits = [_]f32{ 1.0, 5.0, 2.0, 3.0 };
     const token = sampler.sample(&logits, &.{});
     try std.testing.expectEqual(@as(TokenID, 1), token);
@@ -308,12 +312,12 @@ test "temperature scaling" {
     var opts_low = Options.default;
     opts_low.temperature = 0.1;
     opts_low.seed = 42;
-    var sampler_low = init(opts_low);
+    var sampler_low = init(std.testing.io, opts_low);
 
     var opts_high = Options.default;
     opts_high.temperature = 2.0;
     opts_high.seed = 42;
-    var sampler_high = init(opts_high);
+    var sampler_high = init(std.testing.io, opts_high);
 
     var logits1 = [_]f32{ 1.0, 5.0, 2.0, 3.0 };
     var logits2 = [_]f32{ 1.0, 5.0, 2.0, 3.0 };
@@ -331,7 +335,7 @@ test "top_k filtering" {
     opts.top_k = 2;
     opts.temperature = 1.0;
     opts.seed = 42;
-    var sampler = init(opts);
+    var sampler = init(std.testing.io, opts);
     const logits = [_]f32{ 1.0, 5.0, 4.0, 0.5 };
 
     // Run multiple times - should only ever pick from top 2 (indices 1 and 2)
@@ -347,7 +351,7 @@ test "repetition penalty" {
     var opts = Options.default;
     opts.temperature = 0.0;
     opts.repetition_penalty = 100.0;
-    var sampler = init(opts);
+    var sampler = init(std.testing.io, opts);
     const logits = [_]f32{ 1.0, 5.0, 4.9, 0.5 };
 
     // Without history, picks token 1 (highest)
@@ -375,7 +379,7 @@ test "repetition penalty: per-unique, not per-occurrence" {
     opts.temperature = 0.0;
     opts.repetition_penalty = 2.0;
     opts.repetition_penalty_last_n = 64;
-    var sampler = init(opts);
+    var sampler = init(std.testing.io, opts);
     const logits = [_]f32{ 1.0, 5.0, 2.0, 0.5 };
 
     // History has token 1 repeated 50 times. Per-unique penalty: 5/2 = 2.5
@@ -397,7 +401,7 @@ test "repetition penalty: last_n window excludes old history" {
     opts.temperature = 0.0;
     opts.repetition_penalty = 100.0;
     opts.repetition_penalty_last_n = 4;
-    var sampler = init(opts);
+    var sampler = init(std.testing.io, opts);
     const logits = [_]f32{ 1.0, 5.0, 4.9, 0.5 };
 
     // Token 1 appears at history[0], window is last 4 → only history[1..5]
@@ -417,7 +421,7 @@ test "repetition penalty: negative logits scaled per-unique" {
     opts.temperature = 0.0;
     opts.repetition_penalty = 2.0;
     opts.repetition_penalty_last_n = 64;
-    var sampler = init(opts);
+    var sampler = init(std.testing.io, opts);
 
     // Token 0 starts negative; per-unique penalty: -1.0 * 2.0 = -2.0
     // (pushes further negative). Per-occurrence (broken) over 10 repeats:
@@ -438,7 +442,7 @@ test "repetition penalty: ignores out-of-range token ids" {
     var opts = Options.default;
     opts.temperature = 0.0;
     opts.repetition_penalty = 100.0;
-    var sampler = init(opts);
+    var sampler = init(std.testing.io, opts);
     const logits = [_]f32{ 1.0, 5.0, 4.9, 0.5 };
 
     // history[0] is out of range; without skip we'd read OOB / panic.
