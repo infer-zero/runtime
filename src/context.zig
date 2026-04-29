@@ -66,6 +66,14 @@ pub const VTable = struct {
     /// `next` / call; `Context.next` and friends `memcpy` it into
     /// their own `logits_buf` before doing anything else.
     next: *const fn (*Context, u32) anyerror![]const f32,
+
+    /// Optional: free the `ConcreteContext` wrapper (and its embedded
+    /// `Context`). Polymorphic callers that own the Context's lifetime
+    /// call this on shutdown. Variants whose wrapper is freed out-of-band
+    /// (e.g. via `@fieldParentPtr` by a comptime-aware caller) can leave
+    /// it null. When null, harness-v2 runners skip the call — the caller
+    /// that owns the wrapper is responsible for teardown.
+    destroy: ?*const fn (*Context) void = null,
 };
 
 /// Free the generic state owned by this Context (logits buffer,

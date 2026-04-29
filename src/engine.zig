@@ -19,6 +19,13 @@
 vocabulary_size: usize,
 max_len: usize,
 vtable: *const VTable,
+/// Optional teardown: tear down the variant's full allocation —
+/// weights, caches, thread pool, family aggregate, etc. Polymorphic
+/// callers (e.g. harness-v2 runners) that own the Model's lifetime
+/// call this on shutdown. Variants that are stack-allocated or whose
+/// lifetime is caller-managed can leave it null; the harness treats
+/// missing `destroy` as "caller handles it" and skips the call.
+destroy: ?*const fn (*Engine) void = null,
 
 const Engine = @This();
 
