@@ -16,7 +16,6 @@ pub const Model = @import("model.zig");
 // Tier 5 (chat driver + its overlay + chat vocabulary)
 pub const ChatSession = @import("chat_session.zig");
 pub const Chat = ChatSession.Chat;
-pub const Tool = Chat.Tool;
 pub const ChatOptions = Chat.ChatOptions;
 pub const SpecialTokens = Chat.SpecialTokens;
 pub const TokenClass = Chat.TokenClass;
@@ -26,6 +25,9 @@ pub const Parameters = ChatSession.Parameters;
 pub const Parameter = ChatSession.Parameter;
 pub const ParamType = ChatSession.ParamType;
 
+// Tool-call body parsers shared across families.
+pub const hermes = @import("hermes.zig");
+
 test {
     _ = Tensor;
     _ = Sampler;
@@ -34,5 +36,5 @@ test {
     _ = Model;
     _ = ChatSession;
     _ = Chat;
-    _ = Tool;
+    _ = hermes;
 }

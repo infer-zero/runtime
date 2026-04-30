@@ -358,60 +358,33 @@ fn resetStreamingState(self: *ChatSession) void {
     self.tool_calls = .empty;
 }
 
-/// Parse the JSON in `tool_call_buf` (one `<tool_call>...</tool_call>`
-/// body in Hermes/Qwen3 convention) and append a `Message.ToolCall` to
-/// `self.tool_calls`. Synthesizes the id since Qwen3 tool calls don't
-/// carry one. Malformed JSON is silently dropped — the agent loop will
-/// then see no tool_calls and treat the turn as content-only. Parse
-/// failures are logged via `std.log.scoped(.chat_session)` at debug
-/// level; callers enable them by raising the log level.
+/// Dispatch the buffered `<tool_call>...</tool_call>` body through the
+/// chat overlay's `tool.parseToolCall` hook and append the result to
+/// `self.tool_calls`. Synthesizes the id since the wire format (Hermes
+/// today) doesn't carry one. The chat overlay must wire `tool` if it
+/// declares `tool_call_start`/`tool_call_end` special tokens; if it
+/// doesn't, this is a no-op. Parser errors (malformed bodies, OOM) are
+/// silently dropped — the agent loop then sees no tool_calls and
+/// treats the turn as content-only. Diagnostics are logged inside the
+/// parser.
 fn commitToolCall(self: *ChatSession) !void {
     const arena_alloc = self.arena.allocator();
     defer self.tool_call_buf.clearRetainingCapacity();
 
-    const raw = std.mem.trim(u8, self.tool_call_buf.items, " \t\r\n");
-    if (raw.len == 0) return;
+    const tool = self.chat.tool orelse return;
 
-    const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, raw, .{}) catch {
-        logToolCallDrop("JSON parse error", raw);
-        return;
-    };
-    defer parsed.deinit();
-    if (parsed.value != .object) {
-        logToolCallDrop("top-level value is not an object", raw);
-        return;
-    }
-    const obj = parsed.value.object;
-
-    const name_v = obj.get("name") orelse {
-        logToolCallDrop("missing \"name\" field", raw);
-        return;
-    };
-    if (name_v != .string) {
-        logToolCallDrop("\"name\" is not a string", raw);
-        return;
-    }
-
-    const args_str: []u8 = if (obj.get("arguments")) |args_v|
-        try std.json.Stringify.valueAlloc(self.allocator, args_v, .{})
-    else
-        try self.allocator.dupe(u8, "{}");
-    defer self.allocator.free(args_str);
+    const parsed = tool.parseToolCall(self.allocator, self.tool_call_buf.items) catch return;
+    defer self.allocator.free(parsed.name);
+    defer self.allocator.free(parsed.arguments);
 
     var id_buf: [32]u8 = undefined;
     const id_str = std.fmt.bufPrint(&id_buf, "call_{d}", .{self.tool_calls.items.len}) catch unreachable;
 
     try self.tool_calls.append(arena_alloc, .{
         .id = try arena_alloc.dupe(u8, id_str),
-        .name = try arena_alloc.dupe(u8, name_v.string),
-        .arguments = try arena_alloc.dupe(u8, args_str),
+        .name = try arena_alloc.dupe(u8, parsed.name),
+        .arguments = try arena_alloc.dupe(u8, parsed.arguments),
     });
-}
-
-fn logToolCallDrop(reason: []const u8, raw: []const u8) void {
-    const preview = if (raw.len <= 200) raw else raw[0..200];
-    const ellipsis: []const u8 = if (raw.len > 200) "..." else "";
-    log.debug("tool_call dropped: {s}\n  raw: \"{s}{s}\"", .{ reason, preview, ellipsis });
 }
 
 fn finalizeTurn(self: *ChatSession) !void {
@@ -620,9 +593,13 @@ pub const Chat = struct {
         return try buf.toOwnedSlice(allocator);
     }
 
-    /// Optional tool-calling support nested inside `Chat`.
+    /// Optional tool-calling support nested inside `Chat`. A variant
+    /// that defines `tool_call_start` / `tool_call_end` boundary tokens
+    /// must also populate this so `ChatSession` knows how to parse the
+    /// buffered body. Today Qwen3 and Granite Hybrid both wire
+    /// `runtime.hermes.parseToolCall`; non-Hermes dialects can supply
+    /// their own.
     pub const Tool = struct {
-        renderToolSpec: *const fn (std.mem.Allocator, []const ToolSpec) anyerror![]const u8,
         parseToolCall: *const fn (std.mem.Allocator, []const u8) anyerror!ParsedToolCall,
 
         pub const ParsedToolCall = struct {
@@ -755,6 +732,5 @@ pub const ParamType = enum {
 };
 
 const std = @import("std");
-const log = std.log.scoped(.chat_session);
 const Context = @import("context.zig");
 const Sampler = @import("sampler.zig");
