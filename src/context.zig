@@ -24,7 +24,7 @@ tokenizer: Tokenizer,
 sampler: Sampler,
 max_len: usize,
 current_token: u32,
-history: std.ArrayListUnmanaged(u32),
+history: std.ArrayList(u32),
 logits_buf: []f32,
 /// `logits_buf` already holds logits for the next sample — set by
 /// `prefill`, cleared by the first `next` that consumes them.

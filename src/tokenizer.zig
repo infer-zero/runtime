@@ -22,7 +22,7 @@ pub fn init(vocabulary: Vocabulary) Tokenizer {
 
 /// Decode tokens to text
 pub fn decode(self: Tokenizer, allocator: std.mem.Allocator, tokens: []const TokenID) ![]const u8 {
-    var text: std.ArrayListUnmanaged(u8) = .empty;
+    var text: std.ArrayList(u8) = .empty;
 
     for (tokens) |token| {
         if (self.vocabulary.decoding.get(token)) |word| {
@@ -66,12 +66,12 @@ pub fn decodeToken(self: Tokenizer, token: TokenID) []const u8 {
 pub fn encode(self: Tokenizer, allocator: std.mem.Allocator, input: []const u8) ![]const TokenID {
     const special_sorted = self.vocabulary.special_tokens_sorted;
 
-    var result: std.ArrayListUnmanaged(TokenID) = .empty;
+    var result: std.ArrayList(TokenID) = .empty;
     defer result.deinit(allocator);
 
     if (special_sorted.len > 0) {
         // Split input on special tokens, then encode each regular segment
-        var segments: std.ArrayListUnmanaged(Segment) = .empty;
+        var segments: std.ArrayList(Segment) = .empty;
         defer segments.deinit(allocator);
         try splitOnSpecialTokens(allocator, input, special_sorted, &segments);
 
@@ -105,7 +105,7 @@ fn splitOnSpecialTokens(
     allocator: std.mem.Allocator,
     input: []const u8,
     special_sorted: []const Vocabulary.SpecialTokenEntry,
-    segments: *std.ArrayListUnmanaged(Segment),
+    segments: *std.ArrayList(Segment),
 ) !void {
     var pos: usize = 0;
     var last_regular_start: usize = 0;
@@ -138,7 +138,7 @@ fn splitOnSpecialTokens(
     }
 }
 
-fn encodeRegularText(self: Tokenizer, allocator: std.mem.Allocator, input: []const u8, result: *std.ArrayListUnmanaged(TokenID)) !void {
+fn encodeRegularText(self: Tokenizer, allocator: std.mem.Allocator, input: []const u8, result: *std.ArrayList(TokenID)) !void {
     if (input.len == 0) return;
 
     const normalized = if (self.vocabulary.normalizer) |normalizer|
@@ -172,7 +172,7 @@ fn encodeRegularText(self: Tokenizer, allocator: std.mem.Allocator, input: []con
 }
 
 fn splitAndMerge(self: Tokenizer, arena: std.mem.Allocator, input: []const u8) ![]const []const u8 {
-    var subwords: std.ArrayListUnmanaged([]const u8) = .empty;
+    var subwords: std.ArrayList([]const u8) = .empty;
 
     const utf8_view = std.unicode.Utf8View.init(input) catch unreachable;
     var utf8_iter = utf8_view.iterator();
@@ -184,8 +184,8 @@ fn splitAndMerge(self: Tokenizer, arena: std.mem.Allocator, input: []const u8) !
         return &.{};
     }
 
-    var merged_buffer: std.ArrayListUnmanaged(u8) = .empty;
-    var key_buf: std.ArrayListUnmanaged(u8) = .empty;
+    var merged_buffer: std.ArrayList(u8) = .empty;
+    var key_buf: std.ArrayList(u8) = .empty;
 
     while (true) {
         var best_merge_idx: ?usize = null;
@@ -261,7 +261,7 @@ fn postProcess(allocator: std.mem.Allocator, post_processor: Vocabulary.PostProc
             return result;
         },
         .template => |template| {
-            var result: std.ArrayListUnmanaged(TokenID) = .empty;
+            var result: std.ArrayList(TokenID) = .empty;
             defer result.deinit(allocator);
 
             for (template) |tmpl| {
@@ -336,7 +336,7 @@ const ByteLevelTable = struct {
     }
 
     fn encode(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
-        var result: std.ArrayListUnmanaged(u8) = .empty;
+        var result: std.ArrayList(u8) = .empty;
         errdefer result.deinit(allocator);
         try result.ensureTotalCapacity(allocator, input.len * 3);
 
@@ -351,7 +351,7 @@ const ByteLevelTable = struct {
 };
 
 fn sentencePiecePreprocess(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
-    var result: std.ArrayListUnmanaged(u8) = .empty;
+    var result: std.ArrayList(u8) = .empty;
     errdefer result.deinit(allocator);
 
     const already_has_prefix = input.len >= MetaSpace.len and

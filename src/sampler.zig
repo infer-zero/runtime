@@ -46,14 +46,6 @@ pub const Presets = struct {
     base: ?Options = null,
     instruct_non_thinking: ?Options = null,
     instruct_thinking: ?Options = null,
-
-    pub fn get(self: Presets, profile: Profile) ?Options {
-        return switch (profile) {
-            .base => self.base,
-            .instruct_non_thinking => self.instruct_non_thinking,
-            .instruct_thinking => self.instruct_thinking,
-        };
-    }
 };
 
 pub fn init(io: std.Io, options: Options) @This() {

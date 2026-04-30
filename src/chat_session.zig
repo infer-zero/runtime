@@ -25,7 +25,7 @@ allocator: std.mem.Allocator,
 arena: std.heap.ArenaAllocator,
 chat: Chat,
 context: *Context,
-messages: std.ArrayListUnmanaged(Message),
+messages: std.ArrayList(Message),
 options: Chat.ChatOptions,
 phase: Phase = .idle,
 /// KV-cache position recorded at the start of the current assistant
@@ -33,10 +33,10 @@ phase: Phase = .idle,
 /// Used by `absorbEndOfTurn` to truncate + re-prefill content without
 /// thinking. Undefined unless `phase == .streaming`.
 turn_start_pos: usize = 0,
-content_buf: std.ArrayListUnmanaged(u8) = .empty,
-thinking_buf: std.ArrayListUnmanaged(u8) = .empty,
-tool_call_buf: std.ArrayListUnmanaged(u8) = .empty,
-tool_calls: std.ArrayListUnmanaged(Message.ToolCall) = .empty,
+content_buf: std.ArrayList(u8) = .empty,
+thinking_buf: std.ArrayList(u8) = .empty,
+tool_call_buf: std.ArrayList(u8) = .empty,
+tool_calls: std.ArrayList(Message.ToolCall) = .empty,
 
 const ChatSession = @This();
 
@@ -82,13 +82,11 @@ pub fn init(
     options: Chat.ChatOptions,
 ) !ChatSession {
     if (context.engine.sampler_presets) |presets| {
-        const profile: Sampler.Profile = if (options.thinking)
-            .instruct_thinking
+        const preset = if (options.thinking)
+            presets.instruct_thinking
         else
-            .instruct_non_thinking;
-        if (presets.get(profile)) |preset| {
-            context.sampler.options = preset;
-        }
+            presets.instruct_non_thinking;
+        if (preset) |opts| context.sampler.options = opts;
     }
 
     const prefix = try chat.formatSystem(allocator, options);
@@ -593,7 +591,7 @@ pub const Chat = struct {
         messages: []const Message,
         options: ChatOptions,
     ) ![]const u8 {
-        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        var buf: std.ArrayList(u8) = .empty;
         errdefer buf.deinit(allocator);
 
         const system = try self.formatSystem(allocator, options);

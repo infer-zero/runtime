@@ -19,13 +19,6 @@
 vocabulary_size: usize,
 max_len: usize,
 vtable: *const VTable,
-/// Optional teardown: tear down the variant's full allocation —
-/// weights, caches, thread pool, family aggregate, etc. Polymorphic
-/// callers (e.g. harness-v2 runners) that own the Model's lifetime
-/// call this on shutdown. Variants that are stack-allocated or whose
-/// lifetime is caller-managed can leave it null; the harness treats
-/// missing `destroy` as "caller handles it" and skips the call.
-destroy: ?*const fn (*Engine) void = null,
 /// Per-family preset table keyed by `Sampler.Profile`. Borrowed —
 /// typically a `pub const` in the family's `common/sampler_defaults.zig`.
 /// Null when the family has not wired presets.
@@ -45,6 +38,14 @@ pub const VTable = struct {
         Tokenizer,
         Context.Options,
     ) anyerror!*Context,
+
+    /// Tear down the variant's full allocation — weights, caches,
+    /// thread pool, family aggregate, etc. Polymorphic callers (e.g.
+    /// harness-v2 runners) that own the Model's lifetime call this on
+    /// shutdown via `Engine.destroy`. Variants whose lifetime is
+    /// stack- or caller-managed install a no-op so the slot is always
+    /// safe to invoke; whether to call it is the caller's choice.
+    destroy: *const fn (*Engine) void,
 
     /// Optional tokenizer override. Variants whose tokenizer state lives
     /// outside the runtime's `Tokenizer` (e.g. wrappers around an
@@ -66,6 +67,13 @@ pub fn createContext(
     options: Context.Options,
 ) !*Context {
     return try self.vtable.createContext(self, io, allocator, tokenizer, options);
+}
+
+/// Tear down the variant's full allocation. Calling this is the
+/// caller's choice — variants that don't allocate (stack-allocated,
+/// caller-managed) install a no-op.
+pub fn destroy(self: *Engine) void {
+    self.vtable.destroy(self);
 }
 
 /// Encode `text` to tokens using the variant's native tokenizer if it
