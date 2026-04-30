@@ -34,6 +34,28 @@ pub const Options = struct {
     };
 };
 
+/// Sampling regime requested by a caller. Wider than loader-level
+/// `ModelKind` because hybrid Qwen3 checkpoints support both thinking
+/// and non-thinking modes from one file with different recipes per
+/// mode.
+pub const Profile = enum { base, instruct_non_thinking, instruct_thinking };
+
+/// Per-family preset table. Each field is optional — a family only
+/// fills the profiles its HF card publishes a recipe for.
+pub const Presets = struct {
+    base: ?Options = null,
+    instruct_non_thinking: ?Options = null,
+    instruct_thinking: ?Options = null,
+
+    pub fn get(self: Presets, profile: Profile) ?Options {
+        return switch (profile) {
+            .base => self.base,
+            .instruct_non_thinking => self.instruct_non_thinking,
+            .instruct_thinking => self.instruct_thinking,
+        };
+    }
+};
+
 pub fn init(io: std.Io, options: Options) @This() {
     const seed = options.seed orelse blk: {
         var seed_bytes: [8]u8 = undefined;
@@ -46,13 +68,24 @@ pub fn init(io: std.Io, options: Options) @This() {
     };
 }
 
-/// Sample a token from the logits distribution.
+/// Sample a token from the logits distribution using `self.options`.
 /// Takes logits buffer and history for repetition penalty.
 /// Note: This function modifies the logits array in place.
 pub fn sample(
     self: *@This(),
     logits: []f32,
     history: []const TokenID,
+) TokenID {
+    return self.sampleWith(logits, history, self.options);
+}
+
+/// Sample a token using an explicit `Options` instead of `self.options`.
+/// One-shot — `self.options` is not mutated. RNG is shared with `sample`.
+pub fn sampleWith(
+    self: *@This(),
+    logits: []f32,
+    history: []const TokenID,
+    options: Options,
 ) TokenID {
     // Apply repetition penalty ONCE per unique token in the last
     // `repetition_penalty_last_n` history positions. Matches llama.cpp's
@@ -61,8 +94,8 @@ pub fn sample(
     // logit / penalty^count and were crushed below alternatives — which
     // surfaced as multilingual / missing-space drift on long-context
     // generation, especially at higher penalty values like 1.1.
-    if (self.options.repetition_penalty != 1.0 and history.len > 0) {
-        const last_n = @as(usize, self.options.repetition_penalty_last_n);
+    if (options.repetition_penalty != 1.0 and history.len > 0) {
+        const last_n = @as(usize, options.repetition_penalty_last_n);
         const start = if (history.len > last_n) history.len - last_n else 0;
         const window = history[start..];
 
@@ -81,21 +114,21 @@ pub fn sample(
             if (already_seen) continue;
             const logit = logits[token_id];
             if (logit > 0) {
-                logits[token_id] = logit / self.options.repetition_penalty;
+                logits[token_id] = logit / options.repetition_penalty;
             } else {
-                logits[token_id] = logit * self.options.repetition_penalty;
+                logits[token_id] = logit * options.repetition_penalty;
             }
         }
     }
 
     // Greedy decoding when temperature is 0
-    if (self.options.temperature == 0.0) {
+    if (options.temperature == 0.0) {
         return argmax(logits);
     }
 
     // Top-k filtering: keep only the top-k logits
-    if (self.options.top_k > 0 and self.options.top_k < logits.len) {
-        const threshold = findTopKThreshold(logits, self.options.top_k);
+    if (options.top_k > 0 and options.top_k < logits.len) {
+        const threshold = findTopKThreshold(logits, options.top_k);
         for (logits) |*logit| {
             if (logit.* < threshold) {
                 logit.* = -1e10; // Very negative but not -inf to avoid NaN in softmax
@@ -105,19 +138,19 @@ pub fn sample(
 
     // Apply temperature scaling
     for (logits) |*logit| {
-        logit.* /= self.options.temperature;
+        logit.* /= options.temperature;
     }
 
     // Apply softmax to get probabilities
     softmax(logits);
 
     // Apply min-p filtering: keep tokens with prob >= min_p * max_prob
-    if (self.options.min_p > 0.0) {
+    if (options.min_p > 0.0) {
         var max_prob: f32 = 0.0;
         for (logits) |prob| {
             max_prob = @max(max_prob, prob);
         }
-        const min_threshold = self.options.min_p * max_prob;
+        const min_threshold = options.min_p * max_prob;
         for (logits) |*prob| {
             if (prob.* < min_threshold) {
                 prob.* = 0.0;
@@ -126,8 +159,8 @@ pub fn sample(
     }
 
     // Apply top-p (nucleus) filtering: keep smallest set of tokens with cumulative prob >= top_p
-    if (self.options.top_p < 1.0) {
-        applyTopP(logits, self.options.top_p);
+    if (options.top_p < 1.0) {
+        applyTopP(logits, options.top_p);
     }
 
     // Sample from the probability distribution (handles unnormalized probs)

@@ -30,6 +30,9 @@ logits_buf: []f32,
 /// `prefill`, cleared by the first `next` that consumes them.
 has_pending_logits: bool,
 vtable: *const VTable,
+/// Producing `Engine`. Set by every `createContext` implementation;
+/// carries the family's tokenizer hooks and sampler presets.
+engine: *Engine,
 
 const Context = @This();
 
@@ -111,12 +114,25 @@ pub fn truncateTo(self: *Context, position: usize) !void {
     self.has_pending_logits = false;
 }
 
+/// Encode text to tokens. Routes through the engine's optional `encode`
+/// hook when set (variants that delegate tokenization to an external
+/// library), and falls back to the embedded `Tokenizer.encode` otherwise.
+pub fn encode(self: *Context, allocator: std.mem.Allocator, text: []const u8) ![]const u32 {
+    return try self.engine.encode(allocator, text, self.tokenizer);
+}
+
+/// Decode tokens to text. Mirrors `encode` — engine hook first, then the
+/// embedded `Tokenizer.decode` fallback.
+pub fn decode(self: *Context, allocator: std.mem.Allocator, tokens: []const u32) ![]const u8 {
+    return try self.engine.decode(allocator, tokens, self.tokenizer);
+}
+
 /// Extend the context with `prompt`. After return, every token in
 /// `prompt` is in the K/V cache, `current_token` is the last prompt
 /// token, and `logits_buf` holds the logits for sampling the next token.
 /// Safe to call repeatedly to extend across turns.
 pub fn prefill(self: *Context, prompt: []const u8) !void {
-    const tokens = try self.tokenizer.encode(self.allocator, prompt);
+    const tokens = try self.encode(self.allocator, prompt);
     defer self.allocator.free(tokens);
     if (tokens.len == 0) return;
 
@@ -141,6 +157,17 @@ pub fn prefill(self: *Context, prompt: []const u8) !void {
 ///
 /// Returns `error.ContextFull` if the context has reached `max_len`.
 pub fn next(self: *Context) ![]const u8 {
+    return self.nextInner(null);
+}
+
+/// Like `next` but samples with `sampler_override` instead of the
+/// session's stored `sampler.options`. One-shot — `sampler.options` is
+/// not mutated.
+pub fn nextWith(self: *Context, sampler_override: Sampler.Options) ![]const u8 {
+    return self.nextInner(sampler_override);
+}
+
+fn nextInner(self: *Context, sampler_override: ?Sampler.Options) ![]const u8 {
     if (self.history.items.len >= self.max_len) {
         return error.ContextFull;
     }
@@ -152,12 +179,15 @@ pub fn next(self: *Context) ![]const u8 {
         @memcpy(self.logits_buf, logits);
     }
 
-    const token = self.sampler.sample(self.logits_buf, self.history.items);
+    const token = if (sampler_override) |opts|
+        self.sampler.sampleWith(self.logits_buf, self.history.items, opts)
+    else
+        self.sampler.sample(self.logits_buf, self.history.items);
 
     self.current_token = token;
     try self.history.append(self.allocator, token);
 
-    return try self.tokenizer.decode(self.allocator, &.{token});
+    return try self.decode(self.allocator, &.{token});
 }
 
 /// Commit the KV slot for `current_token` without appending anywhere or
@@ -184,3 +214,4 @@ pub fn absorb(self: *Context, token: u32) !void {
 const std = @import("std");
 const Tokenizer = @import("tokenizer.zig");
 const Sampler = @import("sampler.zig");
+const Engine = @import("engine.zig");

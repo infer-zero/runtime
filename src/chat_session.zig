@@ -69,12 +69,28 @@ pub const Event = union(enum) {
 /// Initialize a chat session that **borrows** `context`. The session
 /// prefix (system_prompt + tools, rendered by `chat.formatSystem`) is
 /// prefilled into the KV cache once here.
+///
+/// If `context.engine.sampler_presets` is set, the matching profile
+/// (`instruct_thinking` when `options.thinking`, else
+/// `instruct_non_thinking`) is written into `context.sampler.options`
+/// so the session uses the model-card recipe by default. Callers can
+/// still override per-turn via `nextWith` / `receiveWith`.
 pub fn init(
     allocator: std.mem.Allocator,
     chat: Chat,
     context: *Context,
     options: Chat.ChatOptions,
 ) !ChatSession {
+    if (context.engine.sampler_presets) |presets| {
+        const profile: Sampler.Profile = if (options.thinking)
+            .instruct_thinking
+        else
+            .instruct_non_thinking;
+        if (presets.get(profile)) |preset| {
+            context.sampler.options = preset;
+        }
+    }
+
     const prefix = try chat.formatSystem(allocator, options);
     defer allocator.free(prefix);
 
@@ -144,12 +160,25 @@ fn prefillUserAndPrime(self: *ChatSession, msg: Message) !void {
 /// the turn is fully drained (after .end_of_turn has been emitted once)
 /// or when no generation is in progress.
 pub fn next(self: *ChatSession) !?Event {
+    return self.nextInner(null);
+}
+
+/// Like `next` but samples with `sampler_override`. One-shot —
+/// `context.sampler.options` is not mutated.
+pub fn nextWith(self: *ChatSession, sampler_override: Sampler.Options) !?Event {
+    return self.nextInner(sampler_override);
+}
+
+fn nextInner(self: *ChatSession, sampler_override: ?Sampler.Options) !?Event {
     const stream_kind = switch (self.phase) {
         .idle => return null,
         .streaming => |kind| kind,
     };
 
-    const text = self.context.next() catch |err| {
+    const text = (if (sampler_override) |opts|
+        self.context.nextWith(opts)
+    else
+        self.context.next()) catch |err| {
         if (err == error.ContextFull) return try self.endTurn();
         return err;
     };
@@ -236,7 +265,7 @@ fn absorbEndOfTurn(self: *ChatSession) !void {
         // just splice the inter-turn suffix.
         const suffix = self.chat.end_of_turn_suffix;
         if (suffix.len > 0) {
-            const suffix_tokens = try self.context.tokenizer.encode(self.allocator, suffix);
+            const suffix_tokens = try self.context.encode(self.allocator, suffix);
             defer self.allocator.free(suffix_tokens);
             for (suffix_tokens) |token| {
                 try self.context.absorb(token);
@@ -254,11 +283,25 @@ fn endTurn(self: *ChatSession) !Event {
 }
 
 /// Drain the current turn to completion and return the assembled
-/// assistant message by value.
+/// assistant message by value. Frees the per-event text slices that
+/// `next` hands back for content/thinking/tool_call events — the
+/// content already lives on the session's arena via the appendSlice in
+/// `next`, so the gpa-owned event text is purely transient here.
 pub fn receive(self: *ChatSession) !Message.Assistant {
-    while (try self.next()) |event| switch (event) {
+    return self.receiveInner(null);
+}
+
+/// Like `receive` but samples every event with `sampler_override`.
+/// One-shot — `context.sampler.options` is not mutated.
+pub fn receiveWith(self: *ChatSession, sampler_override: Sampler.Options) !Message.Assistant {
+    return self.receiveInner(sampler_override);
+}
+
+fn receiveInner(self: *ChatSession, sampler_override: ?Sampler.Options) !Message.Assistant {
+    while (try self.nextInner(sampler_override)) |event| switch (event) {
         .end_of_turn => break,
-        else => {},
+        .content, .thinking, .tool_call => |text| self.allocator.free(text),
+        .thinking_start, .thinking_end, .tool_call_start, .tool_call_end => {},
     };
 
     if (self.messages.items.len == 0) return error.NoTurnGenerated;
@@ -716,3 +759,4 @@ pub const ParamType = enum {
 const std = @import("std");
 const log = std.log.scoped(.chat_session);
 const Context = @import("context.zig");
+const Sampler = @import("sampler.zig");

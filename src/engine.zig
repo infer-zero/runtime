@@ -26,6 +26,10 @@ vtable: *const VTable,
 /// lifetime is caller-managed can leave it null; the harness treats
 /// missing `destroy` as "caller handles it" and skips the call.
 destroy: ?*const fn (*Engine) void = null,
+/// Per-family preset table keyed by `Sampler.Profile`. Borrowed —
+/// typically a `pub const` in the family's `common/sampler_defaults.zig`.
+/// Null when the family has not wired presets.
+sampler_presets: ?*const @import("sampler.zig").Presets = null,
 
 const Engine = @This();
 
@@ -41,6 +45,17 @@ pub const VTable = struct {
         Tokenizer,
         Context.Options,
     ) anyerror!*Context,
+
+    /// Optional tokenizer override. Variants whose tokenizer state lives
+    /// outside the runtime's `Tokenizer` (e.g. wrappers around an
+    /// external library that owns its own vocabulary) install these so
+    /// `Context.prefill` and other call sites route through the variant's
+    /// native tokenizer instead of the embedded `Tokenizer`. When `null`,
+    /// `Context.encode` / `Context.decode` fall back to the embedded
+    /// `Tokenizer.encode` / `.decode`. Returned slices are owned by the
+    /// caller and freed via `allocator`.
+    encode: ?*const fn (*Engine, std.mem.Allocator, []const u8) anyerror![]const u32 = null,
+    decode: ?*const fn (*Engine, std.mem.Allocator, []const u32) anyerror![]const u8 = null,
 };
 
 pub fn createContext(
@@ -51,6 +66,32 @@ pub fn createContext(
     options: Context.Options,
 ) !*Context {
     return try self.vtable.createContext(self, io, allocator, tokenizer, options);
+}
+
+/// Encode `text` to tokens using the variant's native tokenizer if it
+/// installed an `encode` hook; otherwise fall back to `fallback.encode`.
+/// Used by callers that have an `Engine` + a fallback `Tokenizer` but no
+/// `Context` yet (e.g. bench seeding a synthetic prefill prompt).
+pub fn encode(
+    self: *Engine,
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    fallback: Tokenizer,
+) ![]const u32 {
+    if (self.vtable.encode) |hook| return try hook(self, allocator, text);
+    return try fallback.encode(allocator, text);
+}
+
+/// Decode `tokens` to text. Mirrors `encode` — vtable hook first, then
+/// the fallback `Tokenizer.decode`.
+pub fn decode(
+    self: *Engine,
+    allocator: std.mem.Allocator,
+    tokens: []const u32,
+    fallback: Tokenizer,
+) ![]const u8 {
+    if (self.vtable.decode) |hook| return try hook(self, allocator, tokens);
+    return try fallback.decode(allocator, tokens);
 }
 
 const std = @import("std");
