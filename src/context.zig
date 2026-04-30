@@ -142,7 +142,11 @@ pub fn prefill(self: *Context, prompt: []const u8) !void {
 
     try self.vtable.prefill(self, tokens);
     const logits = try self.vtable.next(self, tokens[tokens.len - 1]);
-    @memcpy(self.logits_buf, logits);
+    // Variants are free to either compute into a private buffer (then we
+    // copy out into our `logits_buf`) or write directly into our buffer
+    // and hand the same slice back. Skip the no-op memcpy in the latter
+    // case — `@memcpy` panics on aliasing in safety-checked builds.
+    if (logits.ptr != self.logits_buf.ptr) @memcpy(self.logits_buf, logits);
 
     self.current_token = tokens[tokens.len - 1];
     self.has_pending_logits = true;
@@ -176,7 +180,7 @@ fn nextInner(self: *Context, sampler_override: ?Sampler.Options) ![]const u8 {
         self.has_pending_logits = false;
     } else {
         const logits = try self.vtable.next(self, self.current_token);
-        @memcpy(self.logits_buf, logits);
+        if (logits.ptr != self.logits_buf.ptr) @memcpy(self.logits_buf, logits);
     }
 
     const token = if (sampler_override) |opts|
