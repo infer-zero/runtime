@@ -74,8 +74,8 @@ pub const VTable = struct {
     /// `Context`). Polymorphic callers that own the Context's lifetime
     /// call this on shutdown. Variants whose wrapper is freed out-of-band
     /// (e.g. via `@fieldParentPtr` by a comptime-aware caller) can leave
-    /// it null. When null, harness-v2 runners skip the call — the caller
-    /// that owns the wrapper is responsible for teardown.
+    /// it null. When null, callers must skip the call — whoever owns
+    /// the wrapper is responsible for teardown.
     destroy: ?*const fn (*Context) void = null,
 };
 

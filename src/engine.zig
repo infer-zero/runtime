@@ -5,7 +5,7 @@
 //! The factory returns a `*Context` — a pointer into an embedded
 //! `Context` field inside a variant-specific `ConcreteContext` wrapper
 //! the factory heap-allocated. The caller owns the wrapper; when
-//! comptime-aware code (e.g. the harness) knows the variant type, it can
+//! comptime-aware code knows the variant type, it can
 //! `@fieldParentPtr("context", ctx)` to recover `*ConcreteContext` and
 //! call its variant-specific `deinit`. Polymorphic borrowers (e.g.
 //! `ChatSession`) just use `*Context` and do not deinit it.
@@ -40,9 +40,9 @@ pub const VTable = struct {
     ) anyerror!*Context,
 
     /// Tear down the variant's full allocation — weights, caches,
-    /// thread pool, family aggregate, etc. Polymorphic callers (e.g.
-    /// harness-v2 runners) that own the Model's lifetime call this on
-    /// shutdown via `Engine.destroy`. Variants whose lifetime is
+    /// thread pool, family aggregate, etc. Polymorphic callers that
+    /// own the Model's lifetime call this on shutdown via
+    /// `Engine.destroy`. Variants whose lifetime is
     /// stack- or caller-managed install a no-op so the slot is always
     /// safe to invoke; whether to call it is the caller's choice.
     destroy: *const fn (*Engine) void,
