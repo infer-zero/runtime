@@ -1,40 +1,51 @@
-# runtime
+# infer-runtime
 
-The inference runtime: the contract variants implement + the session/driver layer that runs any variant satisfying it. Variants depend on `runtime` at a *type* level (they implement its interfaces); applications depend on `runtime` at an *API* level (they drive inference through `Model`, `Context`, `ChatSession`).
+This is an interface and runtime for implementing inference models in Zig.
 
-## Modules
+Provide the most common foundation as well as an interface with the minimal necessary for a model to offer good inference.
 
-### Data (leaves)
+## Parts
 
-- **Tensor** — Tensor data with BF16/FP32/FP16/Q8_0/Q4_0/Q4_1/Q6_K support. Includes dequantization (`toF32`, `toF16`) and layout calculations.
-- **Message** — Chat turns (user / assistant / tool_result), tool specs, parameter schemas. Lives in `chat_session.zig` alongside `Chat`/`ChatSession` since this is the "chat vocabulary."
+### Data
 
-### Services
+These are the data parts that every model will need.
 
-- **Sampler** — Token sampling with temperature, top-k, top-p, min-p, repetition penalty (applied once per unique token in a sliding window).
-- **Tokenizer** + nested **Vocabulary** — BPE encode/decode. Vocabulary owns the tokenizer-level `eos_token_id`.
+- Tensor: Tensor data with with dequantization (`toF32`, `toF16`) and layout calculations. Supports: F32, BF16, F16,Q8_0,Q4_0,Q4_K_M.
+- Message: Chat turns (user / assistant / tool_result), tool specs, parameter schemas.
+- Vocabulary: Tokens, SpecialTokens, Normalizers and etc.
 
-### Interfaces (session + factory)
+### Common functions
 
-- **Context** (+ nested `Context.VTable`) — the live conversation: history, logits buffer, sampler, KV-cache position. Variants embed a `Context` as a field on their concrete session struct and fill the 4-method vtable (`restart`, `truncateTo`, `prefill`, `next`); `@fieldParentPtr` recovers the wrapper inside vtable impls (std-library `Reader`/`Writer` pattern).
-- **Engine** (+ nested `Engine.VTable`) — per-variant metadata (`vocabulary_size`, `max_len`) plus a single-method factory (`createContext`). Embedded as a field on the concrete variant model type and pointed at by `Model.engine`.
+- Sampler: Token sampling with temperature, top-k, top-p, min-p, repetition penalty.
+- Tokenizer: BPE encode/decode.
 
-### Aggregate + overlays
+### Interfaces (factory + session)
 
-- **Model** — view-only aggregate: `{ tokenizer, engine, chat }`. No `deinit` — the caller owns the concrete variant and deinits it directly.
-- **Chat** (+ nested **Tool**) — optional chat-template overlay: `formatSystem` / `formatMessage` fn pointers, `assistant_prime` / `assistant_prime_no_thinking` / `end_of_turn_suffix` strings, `special_tokens`, `eos_token_id`, and optional nested `Tool` for tool-calling.
+Each interface contains a VTable, and some optional methods depending on model capabilities.
+
+- Engine: Minimal model metadata plus a `Context` factory.
+- Context: The live conversation: history, logits buffer, sampler, KV-cache position. And Methods to reset context, prefill and get next token/text.
+
+### Aggregate + overlays (also Interfaces)
+
+- Model: view-only aggregate: `{ tokenizer, engine, chat }`.
+- Chat (+ nested Tool):optional chat-template overlay: `formatSystem` / `formatMessage` fn pointers, `assistant_prime` / `assistant_prime_no_thinking` / `end_of_turn_suffix` strings, `special_tokens`, `eos_token_id`, and optional nested `Tool` for tool-calling.
 
 ### Driver
 
-- **ChatSession** — multi-turn chat driver. Borrows a `*Context` + a `Chat` overlay and runs the streaming state machine for thinking blocks, tool calls, and end-of-turn suffix injection. Implements **ephemeral thinking**: reasoning tokens live in the KV cache only during their own turn and are rolled back at the turn boundary via `Context.truncateTo`.
+This where most users of runtime will interact.
+
+- ChatSession: multi-turn chat driver. Borrows a `*Context` + a `Chat` overlay and runs the streaming state machine for thinking blocks, tool calls, and end-of-turn suffix injection.
 
 ## Usage
+
+Fetch the library:
 
 ```bash
 zig fetch --save git+https://github.com/infer-zero/runtime
 ```
 
-Then in your `build.zig`:
+Add the model in your `build.zig`:
 
 ```zig
 const runtime_dep = b.dependency("infer_runtime", .{ .target = target, .optimize = optimize });
@@ -80,27 +91,19 @@ var session = try runtime.ChatSession.init(allocator, chat, context, .{
     .system_prompt = "You are a helpful assistant.",
     .thinking = false,
 });
-defer session.deinit();  // frees session arena; does NOT deinit context (ChatSession borrows it)
+defer session.deinit();  // frees session arena; does not deinit context (ChatSession borrows it)
 
 try session.sendText("What's 17 + 23?");
 const reply = try session.receive();
 ```
 
-## Implementation contract for variants
+## AI Usage
 
-A variant's concrete model struct must:
-
-1. Embed `engine: runtime.Engine` as a field, filled at init time with its `vocabulary_size`, `max_len`, and a pointer to a `const engine_vtable: Engine.VTable` that carries `createContext`.
-2. Provide `init(allocator, path) !*Self`, `deinit(self)`, and `toModel(self) runtime.Model`.
-3. Expose a variant-specific Context type that:
-   - Embeds `interface: runtime.Context` as a field (not named `base` — that collides with `const runtime = @import("runtime")` at file-as-struct scope).
-   - Fills a `const context_vtable: Context.VTable` with `restart` / `truncateTo` / `prefill` / `next` impls, each recovering `*Self` via `@fieldParentPtr("interface", ctx)`.
-   - Exposes `init(allocator, *Model, Options) !*Self` and `deinit(self)`.
-4. Optionally build a `Chat` struct literal in `toModel` with the variant's chat-template fn pointers and static prime strings.
-
-## Dependencies
-
-None.
+- The first full version of this library was hand written. 
+- Some functions, fixes and zig version migratation were AI assisted. 
+- Comments and docs were AI written and human edited.
+- All was human reviewed.
+- The design, interfaces and archtecture is my own.
 
 ## License
 
