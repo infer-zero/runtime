@@ -3,21 +3,10 @@
 //! vtable of hot-path methods (`restart`, `prefill`, `next`).
 //!
 //! `Context` is a **view** type, embedded inside each variant's
-//! `ConcreteContext` wrapper. `Engine.createContext` allocates a
-//! ConcreteContext, populates the embedded Context (including the vtable
-//! pointer), and returns `*Context` — a pointer into the embedded field.
-//! The caller owns the concrete (recoverable via `@fieldParentPtr` when
-//! the variant type is known at comptime) and is responsible for its
-//! ultimate cleanup.
-//!
-//! `Context.deinit` frees only the generic state this struct directly
-//! owns (`logits_buf`, `history`). It does **not** go through a vtable —
-//! lifecycle of per-variant state is the caller's concern (typically via
-//! the variant's own `ConcreteContext.deinit` after `@fieldParentPtr`).
-//!
-//! The `Engine` factory type lives in its own file (`engine.zig`) to
-//! keep its nested `VTable` struct from colliding with `Context.VTable`
-//! here.
+//! `ConcreteContext` wrapper by `Engine.createContext`. The caller owns
+//! that wrapper — recoverable via `@fieldParentPtr` when the variant type
+//! is known at comptime — and is responsible for its cleanup. `deinit`
+//! frees only the generic state this struct owns; see its doc.
 
 allocator: std.mem.Allocator,
 tokenizer: Tokenizer,

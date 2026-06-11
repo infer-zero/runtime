@@ -1,20 +1,6 @@
-//! Per-variant metadata + Context factory. Embedded as a field on each
-//! variant's concrete model type and pointed at by `Model.engine`.
-//!
-//! Callers obtain a `Context` by calling `engine.createContext(...)`.
-//! The factory returns a `*Context` — a pointer into an embedded
-//! `Context` field inside a variant-specific `ConcreteContext` wrapper
-//! the factory heap-allocated. The caller owns the wrapper; when
-//! comptime-aware code knows the variant type, it can
-//! `@fieldParentPtr("context", ctx)` to recover `*ConcreteContext` and
-//! call its variant-specific `deinit`. Polymorphic borrowers (e.g.
-//! `ChatSession`) just use `*Context` and do not deinit it.
-//!
-//! Separate file rather than nested in `context.zig` because its own
-//! `VTable` struct would otherwise collide with `Context.VTable`. Still a
-//! vtable pattern for consistency with `Context` — even with a single
-//! method today, grouping behind `vtable: *const VTable` keeps the shape
-//! uniform and leaves room to grow.
+//! Per-variant metadata and `Context` factory, embedded as a field on each
+//! variant's concrete model type and reached via `Model.engine`.
+//! `createContext` is the entry point; see its doc for the ownership contract.
 
 vocabulary_size: usize,
 max_len: usize,
@@ -26,11 +12,12 @@ sampler_presets: ?*const @import("sampler.zig").Presets = null,
 
 const Engine = @This();
 
+// In its own file so this VTable doesn't collide with Context.VTable.
 pub const VTable = struct {
     /// Heap-allocate a `ConcreteContext`, populate its embedded
     /// `Context` (including the `Context.VTable` pointer), and return
     /// `&concrete.context`. The caller owns the returned pointer; see
-    /// the file docstring for the ownership contract.
+    /// `Engine.createContext` for the ownership contract.
     createContext: *const fn (
         *Engine,
         std.Io,
@@ -40,7 +27,7 @@ pub const VTable = struct {
     ) anyerror!*Context,
 
     /// Tear down the variant's full allocation — weights, caches,
-    /// thread pool, family aggregate, etc. Polymorphic callers that
+    /// thread pool, and family aggregate. Polymorphic callers that
     /// own the Model's lifetime call this on shutdown via
     /// `Engine.destroy`. Variants whose lifetime is
     /// stack- or caller-managed install a no-op so the slot is always
@@ -59,6 +46,12 @@ pub const VTable = struct {
     decode: ?*const fn (*Engine, std.mem.Allocator, []const u32) anyerror![]const u8 = null,
 };
 
+/// Create a live `Context` for a new conversation. Returns a `*Context`
+/// pointing into an embedded field of a heap-allocated, variant-specific
+/// `ConcreteContext` wrapper. The caller owns that wrapper: comptime-aware
+/// callers recover it via `@fieldParentPtr("context", ctx)` and call the
+/// variant's `deinit`; polymorphic borrowers (e.g. `ChatSession`) use the
+/// `*Context` and never deinit it.
 pub fn createContext(
     self: *Engine,
     io: std.Io,

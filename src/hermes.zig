@@ -6,7 +6,7 @@
 
 const std = @import("std");
 const log = std.log.scoped(.chat_session);
-const Chat = @import("chat_session.zig").Chat;
+const Chat = @import("chat.zig").Chat;
 
 /// Parse one Hermes-style tool-call body. Returns an OOM error if
 /// allocation fails; returns `error.MalformedToolCall` for any

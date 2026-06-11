@@ -20,7 +20,7 @@ pub fn init(vocabulary: Vocabulary) Tokenizer {
     return .{ .vocabulary = vocabulary };
 }
 
-/// Decode tokens to text
+/// Decode tokens to text. Returns a freshly allocated, caller-owned slice.
 pub fn decode(self: Tokenizer, allocator: std.mem.Allocator, tokens: []const TokenID) ![]const u8 {
     var text: std.ArrayList(u8) = .empty;
 
@@ -57,12 +57,14 @@ pub fn decode(self: Tokenizer, allocator: std.mem.Allocator, tokens: []const Tok
     return try text.toOwnedSlice(allocator);
 }
 
-/// Decode a single token (returns raw form)
+/// Decode a single token to its raw vocabulary form (no byte-level or
+/// MetaSpace post-processing). Borrowed from the vocabulary; "" if the
+/// token is unknown.
 pub fn decodeToken(self: Tokenizer, token: TokenID) []const u8 {
     return self.vocabulary.decoding.get(token) orelse "";
 }
 
-/// Encode text to tokens
+/// Encode text to tokens. Returns a freshly allocated, caller-owned slice.
 pub fn encode(self: Tokenizer, allocator: std.mem.Allocator, input: []const u8) ![]const TokenID {
     const special_sorted = self.vocabulary.special_tokens_sorted;
 

@@ -19,7 +19,7 @@ pub const Options = struct {
     /// UNIQUE token in this window (not per occurrence) — without this,
     /// common tokens like " " accumulate penalty^N where N is their
     /// count in history, which crushes them on long contexts and produces
-    /// the multilingual / missing-space drift we observed at rep=1.1.
+    /// the multilingual / missing-space drift at rep=1.1.
     repetition_penalty_last_n: u32,
     seed: ?u64,
 
@@ -61,8 +61,7 @@ pub fn init(io: std.Io, options: Options) @This() {
 }
 
 /// Sample a token from the logits distribution using `self.options`.
-/// Takes logits buffer and history for repetition penalty.
-/// Note: This function modifies the logits array in place.
+/// Modifies `logits` in place.
 pub fn sample(
     self: *@This(),
     logits: []f32,
@@ -79,13 +78,9 @@ pub fn sampleWith(
     history: []const TokenID,
     options: Options,
 ) TokenID {
-    // Apply repetition penalty ONCE per unique token in the last
-    // `repetition_penalty_last_n` history positions. Matches llama.cpp's
-    // semantics. The earlier implementation iterated all history and
-    // applied per-occurrence, so common tokens (spaces, punctuation) got
-    // logit / penalty^count and were crushed below alternatives — which
-    // surfaced as multilingual / missing-space drift on long-context
-    // generation, especially at higher penalty values like 1.1.
+    // Penalty applies once per UNIQUE token in the window, not per
+    // occurrence — see `repetition_penalty_last_n` for the failure mode
+    // this avoids. Don't switch to per-occurrence.
     if (options.repetition_penalty != 1.0 and history.len > 0) {
         const last_n = @as(usize, options.repetition_penalty_last_n);
         const start = if (history.len > last_n) history.len - last_n else 0;
@@ -113,12 +108,10 @@ pub fn sampleWith(
         }
     }
 
-    // Greedy decoding when temperature is 0
     if (options.temperature == 0.0) {
         return argmax(logits);
     }
 
-    // Top-k filtering: keep only the top-k logits
     if (options.top_k > 0 and options.top_k < logits.len) {
         const threshold = findTopKThreshold(logits, options.top_k);
         for (logits) |*logit| {
@@ -128,12 +121,10 @@ pub fn sampleWith(
         }
     }
 
-    // Apply temperature scaling
     for (logits) |*logit| {
         logit.* /= options.temperature;
     }
 
-    // Apply softmax to get probabilities
     softmax(logits);
 
     // Apply min-p filtering: keep tokens with prob >= min_p * max_prob

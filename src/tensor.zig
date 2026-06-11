@@ -1,20 +1,35 @@
+//! A typed view over a tensor's raw bytes: the `data` slice plus its
+//! `DataType`. `toF32` / `toF16` dequantize (or re-width) into a freshly
+//! allocated, caller-owned slice. Supported formats span the IEEE floats
+//! (BF16, FP32, FP16) and the GGUF block-quantized families (Q4_0, Q4_K,
+//! Q6_K, …).
+
 const Tensor = @This();
 
+/// Raw, un-decoded bytes, laid out per `data_type`.
 data: []const u8,
+/// How to interpret `data`.
 data_type: DataType,
 
+/// Dequantize this tensor's bytes to a freshly allocated, caller-owned
+/// `[]f32` (free with `allocator`). Thin wrapper over `DataType.toF32`.
 pub fn toF32(self: @This(), allocator: std.mem.Allocator) ![]const f32 {
     return self.data_type.toF32(allocator, self.data);
 }
 
+/// Like `toF32`, but produces `[]f16`. Same ownership and errors.
 pub fn toF16(self: @This(), allocator: std.mem.Allocator) ![]const f16 {
     return self.data_type.toF16(allocator, self.data);
 }
 
+/// Free the backing `data` slice.
 pub fn deinit(self: @This(), allocator: std.mem.Allocator) void {
     allocator.free(self.data);
 }
 
+/// Element format of a tensor's bytes: IEEE floats (BF16, FP32, FP16) and
+/// GGUF block-quantized formats (Q8_0, Q4_0, …). Non-exhaustive (`_`) so an
+/// unknown on-disk code round-trips instead of failing to parse.
 pub const DataType = enum(u8) {
     BF16 = 0,
     FP32 = 1,
@@ -28,10 +43,17 @@ pub const DataType = enum(u8) {
     Q5_K = 9,
     _,
 
+    /// Parse a `DataType` from its field name (e.g. `"Q4_K"`, `"BF16"`).
+    /// Unknown names fall back to `.BF16` rather than erroring — callers
+    /// that must reject unknown dtypes check before relying on the result.
     pub fn fromString(dtype_str: []const u8) @This() {
         return std.meta.stringToEnum(@This(), dtype_str) orelse .BF16;
     }
 
+    /// Bytes needed to hold `num_elements` values in this format.
+    /// `error.Overflow` on `usize` overflow. Block-quantized formats assume
+    /// `num_elements` is a whole number of blocks; an unsupported format is
+    /// `unreachable`.
     pub fn byteSize(self: @This(), num_elements: usize) error{Overflow}!usize {
         return switch (self) {
             .BF16, .FP16 => std.math.mul(usize, num_elements, 2),
@@ -47,6 +69,9 @@ pub const DataType = enum(u8) {
         };
     }
 
+    /// Values held by `num_bytes` in this format — the inverse of
+    /// `byteSize`. A trailing partial block is truncated; an unsupported
+    /// format is `unreachable`.
     pub fn numElements(self: @This(), num_bytes: usize) usize {
         return switch (self) {
             .BF16, .FP16 => num_bytes / 2,
@@ -62,6 +87,10 @@ pub const DataType = enum(u8) {
         };
     }
 
+    /// Dequantize `data` (bytes in this format) into a freshly allocated,
+    /// caller-owned `[]f32`. `error.InvalidData` if `data.len` is not a
+    /// whole number of blocks/elements; `error.UnsupportedDataType` for a
+    /// format with no f32 decode path.
     pub fn toF32(self: @This(), allocator: std.mem.Allocator, data: []const u8) ![]const f32 {
         switch (self) {
             .BF16 => {
@@ -315,6 +344,9 @@ pub const DataType = enum(u8) {
         }
     }
 
+    /// Like `toF32`, but produces `[]f16`. Block-quantized formats decode
+    /// through f32 internally, so the same `error.InvalidData` /
+    /// `error.UnsupportedDataType` semantics apply.
     pub fn toF16(self: @This(), allocator: std.mem.Allocator, data: []const u8) ![]const f16 {
         switch (self) {
             .BF16 => {

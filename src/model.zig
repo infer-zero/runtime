@@ -1,24 +1,20 @@
-//! Aggregate view over a loaded variant. Three pieces, all borrowed:
-//!   - `tokenizer`: wraps the variant's `Vocabulary` (merges, encoding/
-//!                  decoding maps, designated `eos_token_id`)
-//!   - `engine`:    pointer to the variant's embedded `Engine` (metadata +
-//!                  `createContext` factory)
-//!   - `chat`:      optional `ChatSession.Chat` overlay (with optional
-//!                  nested `Tool`) — holder only; `ChatSession` is the
-//!                  actual consumer.
+//! Aggregate view over a loaded variant: three borrowed pieces
+//! (`tokenizer`, `engine`, and an optional `chat` overlay). A view, not an
+//! owner — it has no `deinit` and no factory methods.
 //!
-//! Model is a **view**, not an owner. It has no `deinit` and no factory
-//! methods. The caller that constructed the concrete variant (e.g.
+//! The caller that constructed the concrete variant (e.g.
 //! `var v = try MyVariant.load(...);`) owns the variant's lifecycle and
-//! calls the variant's own deinit when done. Contexts are created by
-//! calling `model.engine.createContext(...)`, which returns a `*Context`
-//! pointing into a variant-specific `ConcreteContext` wrapper the
-//! factory heap-allocated. Comptime-aware callers own the wrapper via
-//! `@fieldParentPtr`; polymorphic borrowers (ChatSession) just use the
-//! `*Context` and do not deinit.
+//! calls the variant's own deinit when done. Create contexts via
+//! `model.engine.createContext(...)`; see `Engine.createContext` for the
+//! wrapper-ownership contract.
 
+/// Wraps the variant's `Vocabulary`: merges, encoding/decoding maps, and the
+/// designated `eos_token_id`.
 tokenizer: Tokenizer,
+/// The variant's embedded `Engine`: metadata plus the `createContext` factory.
 engine: *Engine,
+/// Optional chat-template overlay (with optional nested `Tool`). Holder only;
+/// `ChatSession` is the actual consumer. Null for completion-only models.
 chat: ?Chat = null,
 
 const Model = @This();
@@ -35,4 +31,4 @@ pub fn isEndOfTurn(self: *const Model, token: u32) bool {
 
 const Tokenizer = @import("tokenizer.zig");
 const Engine = @import("engine.zig");
-const Chat = @import("chat_session.zig").Chat;
+const Chat = @import("chat.zig").Chat;
