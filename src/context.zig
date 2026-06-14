@@ -1,16 +1,17 @@
-//! One live conversation: a tokenizer (for encode/decode), a per-session
-//! sampler (with its own RNG), history + logits buffers, plus a small
-//! vtable of hot-path methods (`restart`, `prefill`, `next`).
+//! One live conversation: a borrowed `Tokenizer` (for encode/decode), a
+//! borrowed per-session `Sampler` (typically the variant's embedded
+//! `Sampler.Default`), history + logits buffers, plus a small vtable of
+//! hot-path methods (`restart`, `prefill`, `next`).
 //!
 //! `Context` is a **view** type, embedded inside each variant's
-//! `ConcreteContext` wrapper by `Engine.createContext`. The caller owns
+//! `ConcreteContext` wrapper by `Model.createContext`. The caller owns
 //! that wrapper — recoverable via `@fieldParentPtr` when the variant type
 //! is known at comptime — and is responsible for its cleanup. `deinit`
 //! frees only the generic state this struct owns; see its doc.
 
 allocator: std.mem.Allocator,
-tokenizer: Tokenizer,
-sampler: Sampler,
+tokenizer: *Tokenizer,
+sampler: *Sampler,
 max_len: usize,
 current_token: u32,
 history: std.ArrayList(u32),
@@ -19,14 +20,21 @@ logits_buf: []f32,
 /// `prefill`, cleared by the first `next` that consumes them.
 has_pending_logits: bool,
 vtable: *const VTable,
-/// Producing `Engine`. Set by every `createContext` implementation;
-/// carries the family's tokenizer hooks and sampler presets.
-engine: *Engine,
+/// The producing Model's preset table, copied in by every
+/// `createContext` implementation (null when the family has none).
+/// Read by `ChatSession.init` to apply the model-card recipe.
+sampler_presets: ?*const Sampler.Presets,
 
 const Context = @This();
 
 pub const Options = struct {
+    /// Options for the variant-provided default sampler. Ignored when
+    /// `sampler` is set.
     sampler_options: Sampler.Options = .default,
+    /// Caller-provided sampler. Borrowed — must outlive the Context.
+    /// Null → the variant wires up its embedded `Sampler.Default`,
+    /// initialized from `sampler_options`.
+    sampler: ?*Sampler = null,
     max_len: ?usize = null,
 };
 
@@ -59,13 +67,14 @@ pub const VTable = struct {
     /// their own `logits_buf` before doing anything else.
     next: *const fn (*Context, u32) anyerror![]const f32,
 
-    /// Optional: free the `ConcreteContext` wrapper (and its embedded
-    /// `Context`). Polymorphic callers that own the Context's lifetime
-    /// call this on shutdown. Variants whose wrapper is freed out-of-band
-    /// (e.g. via `@fieldParentPtr` by a comptime-aware caller) can leave
-    /// it null. When null, callers must skip the call — whoever owns
-    /// the wrapper is responsible for teardown.
-    destroy: ?*const fn (*Context) void = null,
+    /// Free the `ConcreteContext` wrapper (and its embedded `Context`).
+    /// Polymorphic callers that own the Context's lifetime — those holding
+    /// only a type-erased `*Context` — call this on shutdown. Comptime-aware
+    /// callers may instead recover the wrapper via `@fieldParentPtr` and
+    /// call its concrete `deinit` directly, but this hook must always be
+    /// wired so any polymorphic caller can tear the context down without
+    /// leaking. Required: forgetting it is a compile error, not a silent leak.
+    destroy: *const fn (*Context) void,
 };
 
 /// Free the generic state owned by this Context (logits buffer,
@@ -103,17 +112,14 @@ pub fn truncateTo(self: *Context, position: usize) !void {
     self.has_pending_logits = false;
 }
 
-/// Encode text to tokens. Routes through the engine's optional `encode`
-/// hook when set (variants that delegate tokenization to an external
-/// library), and falls back to the embedded `Tokenizer.encode` otherwise.
+/// Encode text to tokens via the session's `Tokenizer`.
 pub fn encode(self: *Context, allocator: std.mem.Allocator, text: []const u8) ![]const u32 {
-    return try self.engine.encode(allocator, text, self.tokenizer);
+    return try self.tokenizer.encode(allocator, text);
 }
 
-/// Decode tokens to text. Mirrors `encode` — engine hook first, then the
-/// embedded `Tokenizer.decode` fallback.
+/// Decode tokens to text via the session's `Tokenizer`.
 pub fn decode(self: *Context, allocator: std.mem.Allocator, tokens: []const u32) ![]const u8 {
-    return try self.engine.decode(allocator, tokens, self.tokenizer);
+    return try self.tokenizer.decode(allocator, tokens);
 }
 
 /// Extend the context with `prompt`. After return, every token in
@@ -207,4 +213,3 @@ pub fn absorb(self: *Context, token: u32) !void {
 const std = @import("std");
 const Tokenizer = @import("tokenizer.zig");
 const Sampler = @import("sampler.zig");
-const Engine = @import("engine.zig");

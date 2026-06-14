@@ -1,23 +1,28 @@
 //! Hermes-style tool-call body parser. Wired into a chat overlay via
-//! `Chat.tool.parseToolCall`. Used by every family whose tool calls are
-//! emitted as JSON of the shape `{"name": "...", "arguments": {...}}`
+//! `Chat.VTable.parseToolCall`. Used by every family whose tool calls
+//! are emitted as JSON of the shape `{"name": "...", "arguments": {...}}`
 //! between `tool_call_start` / `tool_call_end` boundary tokens — Qwen3
 //! and Granite Hybrid today.
 
 const std = @import("std");
 const log = std.log.scoped(.chat_session);
-const Chat = @import("chat.zig").Chat;
+const Chat = @import("chat.zig");
 
-/// Parse one Hermes-style tool-call body. Returns an OOM error if
-/// allocation fails; returns `error.MalformedToolCall` for any
-/// content-shape problem (non-JSON, non-object, missing/non-string
-/// `name`). Diagnostic is logged at debug level via `chat_session`
-/// scope. Caller owns `name` and `arguments` — free both via the
-/// passed allocator.
+/// Parse one Hermes-style tool-call body. Matches
+/// `Chat.VTable.parseToolCall`; stateless, so the `chat` self pointer
+/// is unused. Hermes emits exactly one call per span, so the returned
+/// slice always has length 1. Returns an OOM error if allocation fails;
+/// returns `error.MalformedToolCall` for any content-shape problem
+/// (non-JSON, non-object, missing/non-string `name`). Diagnostic is
+/// logged at debug level via `chat_session` scope. Caller owns the slice
+/// and each element's `name`/`arguments` — free all via the passed
+/// allocator.
 pub fn parseToolCall(
+    chat: *Chat,
     allocator: std.mem.Allocator,
     body: []const u8,
-) anyerror!Chat.Tool.ParsedToolCall {
+) anyerror![]Chat.ParsedToolCall {
+    _ = chat;
     const raw = std.mem.trim(u8, body, " \t\r\n");
     if (raw.len == 0) {
         logDrop("empty body", raw);
@@ -52,8 +57,11 @@ pub fn parseToolCall(
     errdefer allocator.free(args_str);
 
     const name_dup = try allocator.dupe(u8, name_v.string);
+    errdefer allocator.free(name_dup);
 
-    return .{ .name = name_dup, .arguments = args_str };
+    const result = try allocator.alloc(Chat.ParsedToolCall, 1);
+    result[0] = .{ .name = name_dup, .arguments = args_str };
+    return result;
 }
 
 fn logDrop(reason: []const u8, raw: []const u8) void {
@@ -68,34 +76,46 @@ fn logDrop(reason: []const u8, raw: []const u8) void {
 
 const testing = std.testing;
 
+/// Stateless parser — the self pointer is never dereferenced, so the
+/// tests pass `undefined`.
+const no_chat: *Chat = undefined;
+
+fn freeCalls(calls: []Chat.ParsedToolCall) void {
+    for (calls) |c| {
+        testing.allocator.free(c.name);
+        testing.allocator.free(c.arguments);
+    }
+    testing.allocator.free(calls);
+}
+
 test "parseToolCall accepts well-formed Hermes JSON" {
     const body =
         \\{"name": "get_weather", "arguments": {"city": "Tokyo"}}
     ;
-    const parsed = try parseToolCall(testing.allocator, body);
-    defer testing.allocator.free(parsed.name);
-    defer testing.allocator.free(parsed.arguments);
+    const parsed = try parseToolCall(no_chat, testing.allocator, body);
+    defer freeCalls(parsed);
 
-    try testing.expectEqualStrings("get_weather", parsed.name);
-    try testing.expectEqualStrings("{\"city\":\"Tokyo\"}", parsed.arguments);
+    try testing.expectEqual(@as(usize, 1), parsed.len);
+    try testing.expectEqualStrings("get_weather", parsed[0].name);
+    try testing.expectEqualStrings("{\"city\":\"Tokyo\"}", parsed[0].arguments);
 }
 
 test "parseToolCall defaults missing arguments to empty object" {
     const body =
         \\{"name": "noop"}
     ;
-    const parsed = try parseToolCall(testing.allocator, body);
-    defer testing.allocator.free(parsed.name);
-    defer testing.allocator.free(parsed.arguments);
+    const parsed = try parseToolCall(no_chat, testing.allocator, body);
+    defer freeCalls(parsed);
 
-    try testing.expectEqualStrings("noop", parsed.name);
-    try testing.expectEqualStrings("{}", parsed.arguments);
+    try testing.expectEqual(@as(usize, 1), parsed.len);
+    try testing.expectEqualStrings("noop", parsed[0].name);
+    try testing.expectEqualStrings("{}", parsed[0].arguments);
 }
 
 test "parseToolCall rejects malformed JSON" {
-    try testing.expectError(error.SyntaxError, parseToolCall(testing.allocator, "not json"));
-    try testing.expectError(error.MalformedToolCall, parseToolCall(testing.allocator, "[]"));
-    try testing.expectError(error.MalformedToolCall, parseToolCall(testing.allocator, "{}"));
-    try testing.expectError(error.MalformedToolCall, parseToolCall(testing.allocator, "{\"name\": 5}"));
-    try testing.expectError(error.MalformedToolCall, parseToolCall(testing.allocator, ""));
+    try testing.expectError(error.SyntaxError, parseToolCall(no_chat, testing.allocator, "not json"));
+    try testing.expectError(error.MalformedToolCall, parseToolCall(no_chat, testing.allocator, "[]"));
+    try testing.expectError(error.MalformedToolCall, parseToolCall(no_chat, testing.allocator, "{}"));
+    try testing.expectError(error.MalformedToolCall, parseToolCall(no_chat, testing.allocator, "{\"name\": 5}"));
+    try testing.expectError(error.MalformedToolCall, parseToolCall(no_chat, testing.allocator, ""));
 }

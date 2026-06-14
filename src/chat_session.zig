@@ -1,11 +1,12 @@
 //! Multi-turn chat session: borrows exactly one `Context` (the live KV
-//! cache) plus a `Chat` overlay (`chat.zig`: rendering + token classification).
-//! Drives the streaming state machine for thinking blocks, tool calls, and
-//! end-of-turn suffix injection.
+//! cache) plus a `*Chat` overlay (`chat.zig`: rendering + token
+//! classification). Drives the streaming state machine for thinking
+//! blocks, tool calls, and end-of-turn suffix injection.
 //!
-//! ChatSession **borrows** the Context — it does not deinit on teardown.
-//! The caller owns the ConcreteContext (from the variant's createContext)
-//! and is responsible for its lifecycle.
+//! ChatSession **borrows** the Context and the Chat — it deinits
+//! neither on teardown. The caller owns the ConcreteContext (from
+//! `Model.createContext`) and the family owns the Chat; both must
+//! outlive the session.
 //!
 //! **Ephemeral thinking.** Reasoning tokens are committed to the KV cache
 //! during generation so the model can read its own scratchpad, but at
@@ -23,7 +24,7 @@
 
 allocator: std.mem.Allocator,
 arena: std.heap.ArenaAllocator,
-chat: Chat,
+chat: *Chat,
 context: *Context,
 messages: std.ArrayList(Message),
 options: Chat.ChatOptions,
@@ -70,18 +71,18 @@ pub const Event = union(enum) {
 /// prefix (system_prompt + tools, rendered by `chat.formatSystem`) is
 /// prefilled into the KV cache once here.
 ///
-/// If `context.engine.sampler_presets` is set, the matching profile
+/// If `context.sampler_presets` is set, the matching profile
 /// (`instruct_thinking` when `options.thinking`, else
 /// `instruct_non_thinking`) is written into `context.sampler.options`
 /// so the session uses the model-card recipe by default. Callers can
 /// still override per-turn via `nextWith` / `receiveWith`.
 pub fn init(
     allocator: std.mem.Allocator,
-    chat: Chat,
+    chat: *Chat,
     context: *Context,
     options: Chat.ChatOptions,
 ) !ChatSession {
-    if (context.engine.sampler_presets) |presets| {
+    if (context.sampler_presets) |presets| {
         const preset = if (options.thinking)
             presets.instruct_thinking
         else
@@ -358,33 +359,40 @@ fn resetStreamingState(self: *ChatSession) void {
     self.tool_calls = .empty;
 }
 
-/// Dispatch the buffered `<tool_call>...</tool_call>` body through the
-/// chat overlay's `tool.parseToolCall` hook and append the result to
-/// `self.tool_calls`. Synthesizes the id since the wire format (Hermes
-/// today) doesn't carry one. The chat overlay must wire `tool` if it
-/// declares `tool_call_start`/`tool_call_end` special tokens; if it
-/// doesn't, this is a no-op. Parser errors (malformed bodies, OOM) are
-/// silently dropped — the agent loop then sees no tool_calls and
-/// treats the turn as content-only. Diagnostics are logged inside the
-/// parser.
+/// Dispatch the buffered `<tool_call>...</tool_call>` span through the
+/// chat overlay's `parseToolCall` hook and append each parsed call to
+/// `self.tool_calls`. A single span may yield several calls (Olmo packs
+/// multiple into one `<function_calls>` block); Hermes yields one.
+/// Synthesizes the id since the wire format doesn't carry one. The chat
+/// overlay must install `VTable.parseToolCall` if it declares
+/// `tool_call_start`/`tool_call_end` special tokens; if it doesn't, this
+/// is a no-op (`parseToolCall` returns `error.ToolsNotSupported`,
+/// swallowed with the rest). Parser errors (malformed bodies, OOM) are
+/// silently dropped — the agent loop then sees no tool_calls and treats
+/// the turn as content-only. Diagnostics are logged inside the parser.
 fn commitToolCall(self: *ChatSession) !void {
     const arena_alloc = self.arena.allocator();
     defer self.tool_call_buf.clearRetainingCapacity();
 
-    const tool = self.chat.tool orelse return;
+    const parsed = self.chat.parseToolCall(self.allocator, self.tool_call_buf.items) catch return;
+    defer {
+        for (parsed) |call| {
+            self.allocator.free(call.name);
+            self.allocator.free(call.arguments);
+        }
+        self.allocator.free(parsed);
+    }
 
-    const parsed = tool.parseToolCall(self.allocator, self.tool_call_buf.items) catch return;
-    defer self.allocator.free(parsed.name);
-    defer self.allocator.free(parsed.arguments);
+    for (parsed) |call| {
+        var id_buf: [32]u8 = undefined;
+        const id_str = std.fmt.bufPrint(&id_buf, "call_{d}", .{self.tool_calls.items.len}) catch unreachable;
 
-    var id_buf: [32]u8 = undefined;
-    const id_str = std.fmt.bufPrint(&id_buf, "call_{d}", .{self.tool_calls.items.len}) catch unreachable;
-
-    try self.tool_calls.append(arena_alloc, .{
-        .id = try arena_alloc.dupe(u8, id_str),
-        .name = try arena_alloc.dupe(u8, parsed.name),
-        .arguments = try arena_alloc.dupe(u8, parsed.arguments),
-    });
+        try self.tool_calls.append(arena_alloc, .{
+            .id = try arena_alloc.dupe(u8, id_str),
+            .name = try arena_alloc.dupe(u8, call.name),
+            .arguments = try arena_alloc.dupe(u8, call.arguments),
+        });
+    }
 }
 
 fn finalizeTurn(self: *ChatSession) !void {
@@ -442,5 +450,5 @@ fn dupeMessage(arena: std.mem.Allocator, msg: Message) !Message {
 const std = @import("std");
 const Context = @import("context.zig");
 const Sampler = @import("sampler.zig");
-const Chat = @import("chat.zig").Chat;
-const Message = @import("chat.zig").Message;
+const Chat = @import("chat.zig");
+const Message = @import("message.zig").Message;
