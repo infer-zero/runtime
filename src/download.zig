@@ -75,6 +75,9 @@ fn download(
 
     const reader = response.reader(read_buffer);
 
+    const basepath = std.fs.path.basename(dest_path);
+    try std.Io.Dir.cwd().createDirPath(io, basepath);
+
     const write_buffer = try allocator.alloc(u8, 4096);
     defer allocator.free(write_buffer);
 
