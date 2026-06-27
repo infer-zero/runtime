@@ -1,45 +1,36 @@
-// Tier 1 (pure data)
+///! Common data and interfaces for LLM inference.
 pub const Tensor = @import("tensor.zig");
 
-// Tier 2 (services)
 pub const Sampler = @import("sampler.zig");
+pub const SamplerDefault = @import("sampler_default.zig");
+
 pub const Tokenizer = @import("tokenizer.zig");
-pub const Vocabulary = Tokenizer.Vocabulary;
+pub const TokenizerBPE = @import("tokenizer_bpe.zig");
+pub const Vocabulary = TokenizerBPE.Vocabulary;
 
-// Chat overlay (template interface; driven by `ChatSession`, held by
-// `Model`) + the message vocabulary it renders (`message.zig`).
-pub const Chat = @import("chat.zig");
-pub const ChatOptions = Chat.ChatOptions;
-pub const SpecialTokens = Chat.SpecialTokens;
-pub const TokenClass = Chat.TokenClass;
-pub const Message = @import("message.zig").Message;
-pub const ToolSpec = @import("message.zig").ToolSpec;
-pub const Parameters = @import("message.zig").Parameters;
-pub const Parameter = @import("message.zig").Parameter;
-pub const ParamType = @import("message.zig").ParamType;
+const message = @import("message.zig");
+pub const Marker = message.Marker;
+pub const Message = message.Message;
+pub const ToolSpec = message.ToolSpec;
+pub const Parameters = message.Parameters;
+pub const SimpleParameter = message.SimpleParameter;
+pub const StructuredParameter = message.StructuredParameter;
+pub const StructuredParameterType = message.StructuredParameterType;
 
-// Tier 3 (session)
-pub const Context = @import("context.zig");
-
-// Tier 4 (aggregate handle: owns lifecycle, factory for contexts)
 pub const Model = @import("model.zig");
 
-// Tier 5 (chat driver)
-pub const ChatSession = @import("chat_session.zig");
-
-// Tool-call body parsers shared across families.
-pub const hermes = @import("hermes.zig");
+pub const download = @import("download.zig");
+pub const verifier = @import("verifier.zig");
 
 test {
     _ = Tensor;
     _ = Sampler;
-    _ = Sampler.Default;
+    _ = SamplerDefault;
     _ = Tokenizer;
-    _ = Tokenizer.Bpe;
-    _ = Context;
+    _ = TokenizerBPE;
+    _ = Message;
     _ = Model;
-    _ = ChatSession;
-    _ = Chat;
-    _ = @import("message.zig");
-    _ = hermes;
+
+    _ = download;
+    _ = verifier;
 }

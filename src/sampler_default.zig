@@ -1,46 +1,28 @@
-//! Default `Sampler` implementation: temperature scaling, top-k,
-//! top-p (nucleus), min-p filtering, and repetition penalty, with a
-//! per-instance RNG. Embeds the `Sampler` interface as `.interface`;
-//! variants typically embed one of these in their ConcreteContext and
-//! point `Context.sampler` at it when the caller didn't bring their own.
-
 interface: Sampler,
 rng: std.Random.DefaultPrng,
 
-const DefaultSampler = @This();
-
-const Sampler = @import("sampler.zig");
-const Options = Sampler.Options;
-const TokenID = Sampler.TokenID;
-
-pub fn init(io: std.Io, options: Options) DefaultSampler {
-    const seed = options.seed orelse blk: {
+pub fn init(io: std.Io, src_seed: ?u64) @This() {
+    const seed = src_seed orelse blk: {
         var seed_bytes: [8]u8 = undefined;
         io.random(&seed_bytes);
         break :blk std.mem.readInt(u64, &seed_bytes, .little);
     };
     return .{
         .interface = .{
-            .options = options,
-            .vtable = &vtable,
+            .vtable = &.{
+                .sample = isample,
+            },
         },
         .rng = std.Random.DefaultPrng.init(seed),
     };
 }
 
-const vtable: Sampler.VTable = .{
-    .sample = sampleImpl,
-};
-
-/// `Sampler.VTable.sample` — modifies `logits` in place.
-fn sampleImpl(
-    iface: *Sampler,
+pub fn sample(
+    self: *@This(),
     logits: []f32,
-    history: []const TokenID,
-    options: Options,
-) TokenID {
-    const self: *DefaultSampler = @fieldParentPtr("interface", iface);
-
+    history: []const Sampler.TokenID,
+    options: Sampler.Options,
+) Sampler.TokenID {
     // Penalty applies once per UNIQUE token in the window, not per
     // occurrence — see `Options.repetition_penalty_last_n` for the
     // failure mode this avoids. Don't switch to per-occurrence.
@@ -132,7 +114,17 @@ fn sampleImpl(
     return argmax(logits);
 }
 
-fn argmax(values: []const f32) TokenID {
+fn isample(
+    sampler: *Sampler,
+    logits: []f32,
+    history: []const Sampler.TokenID,
+    options: Sampler.Options,
+) Sampler.TokenID {
+    const self: *@This() = @alignCast(@fieldParentPtr("interface", sampler));
+    return self.sample(logits, history, options);
+}
+
+fn argmax(values: []const f32) Sampler.TokenID {
     var max_value = values[0];
     var max_index: usize = 0;
     for (values, 0..) |value, index| {
@@ -265,7 +257,7 @@ fn applyTopP(probs: []f32, top_p: f32) void {
 
 test "argmax" {
     const values = [_]f32{ 1.0, 3.0, 2.0, 0.5 };
-    try std.testing.expectEqual(@as(TokenID, 1), argmax(&values));
+    try std.testing.expectEqual(@as(Sampler.TokenID, 1), argmax(&values));
 }
 
 test "softmax produces valid distribution" {
@@ -278,129 +270,113 @@ test "softmax produces valid distribution" {
 }
 
 test "greedy sampling" {
-    var opts = Options.default;
+    var opts = Sampler.Options.default;
     opts.temperature = 0.0;
-    var sampler = init(std.testing.io, opts);
+    var sampler = init(std.testing.io, null);
     var logits = [_]f32{ 1.0, 5.0, 2.0, 3.0 };
-    const token = sampler.interface.sample(&logits, &.{});
-    try std.testing.expectEqual(@as(TokenID, 1), token);
+    const token = sampler.interface.sample(&logits, &.{}, opts);
+    try std.testing.expectEqual(@as(Sampler.TokenID, 1), token);
 }
 
 test "temperature scaling" {
     // Higher temperature = more uniform distribution
-    var opts_low = Options.default;
-    opts_low.temperature = 0.1;
-    opts_low.seed = 42;
-    var sampler_low = init(std.testing.io, opts_low);
+    var sampler = init(std.testing.io, 42);
 
-    var opts_high = Options.default;
+    var opts_low = Sampler.Options.default;
+    opts_low.temperature = 0.1;
+
+    var opts_high = Sampler.Options.default;
     opts_high.temperature = 2.0;
-    opts_high.seed = 42;
-    var sampler_high = init(std.testing.io, opts_high);
 
     var logits1 = [_]f32{ 1.0, 5.0, 2.0, 3.0 };
     var logits2 = [_]f32{ 1.0, 5.0, 2.0, 3.0 };
 
     // Low temp should almost always pick the highest
-    const token_low = sampler_low.interface.sample(&logits1, &.{});
-    _ = sampler_high.interface.sample(&logits2, &.{});
+    const token_low = sampler.interface.sample(&logits1, &.{}, opts_low);
+    _ = sampler.interface.sample(&logits2, &.{}, opts_high);
 
     // With very low temperature, should pick argmax
-    try std.testing.expectEqual(@as(TokenID, 1), token_low);
+    try std.testing.expectEqual(@as(Sampler.TokenID, 1), token_low);
 }
 
 test "top_k filtering" {
-    var opts = Options.default;
+    var opts = Sampler.Options.default;
     opts.top_k = 2;
     opts.temperature = 1.0;
-    opts.seed = 42;
-    var sampler = init(std.testing.io, opts);
+
+    var sampler = init(std.testing.io, 42);
     const logits = [_]f32{ 1.0, 5.0, 4.0, 0.5 };
 
     // Run multiple times - should only ever pick from top 2 (indices 1 and 2)
     var trial: usize = 0;
     while (trial < 10) : (trial += 1) {
         var logits_copy = logits;
-        const token = sampler.interface.sample(&logits_copy, &.{});
+        const token = sampler.interface.sample(&logits_copy, &.{}, opts);
         try std.testing.expect(token == 1 or token == 2);
     }
 }
 
 test "repetition penalty" {
-    var opts = Options.default;
+    var opts = Sampler.Options.default;
     opts.temperature = 0.0;
     opts.repetition_penalty = 100.0;
-    var sampler = init(std.testing.io, opts);
+
+    var sampler = init(std.testing.io, null);
     const logits = [_]f32{ 1.0, 5.0, 4.9, 0.5 };
 
     // Without history, picks token 1 (highest)
     var logits1 = logits;
-    const token1 = sampler.interface.sample(&logits1, &.{});
-    try std.testing.expectEqual(@as(TokenID, 1), token1);
+    const token1 = sampler.interface.sample(&logits1, &.{}, opts);
+    try std.testing.expectEqual(@as(Sampler.TokenID, 1), token1);
 
     // With token 1 in history and high penalty, should pick token 2
     var logits2 = logits;
-    const history = [_]TokenID{1};
-    const token2 = sampler.interface.sample(&logits2, &history);
-    try std.testing.expectEqual(@as(TokenID, 2), token2);
+    const history = [_]Sampler.TokenID{1};
+    const token2 = sampler.interface.sample(&logits2, &history, opts);
+    try std.testing.expectEqual(@as(Sampler.TokenID, 2), token2);
 }
 
-// Regression: a token appearing N times in history must be penalized
-// ONCE (per-unique semantics), not N times. The earlier per-occurrence
-// implementation crushed common tokens (spaces, punctuation) with
-// `logit / penalty^N` on long contexts and produced the multilingual
-// drift on Qwen3-4B at rep=1.1. The penalty (2.0) is small enough that
-// per-unique leaves token 1 above token 2 (5/2 = 2.5 > 2.0); the
-// per-occurrence broken behavior would compound it across the 50
-// repeats to (5/2^50 ≪ 2.0) and pick token 2.
 test "repetition penalty: per-unique, not per-occurrence" {
-    var opts = Options.default;
+    var opts = Sampler.Options.default;
     opts.temperature = 0.0;
     opts.repetition_penalty = 2.0;
     opts.repetition_penalty_last_n = 64;
-    var sampler = init(std.testing.io, opts);
+    var sampler = init(std.testing.io, null);
     const logits = [_]f32{ 1.0, 5.0, 2.0, 0.5 };
 
     // History has token 1 repeated 50 times. Per-unique penalty: 5/2 = 2.5
     // (still highest). Per-occurrence (broken): 5/2^50 ≈ 0 (token 2 wins).
-    var history: [50]TokenID = undefined;
+    var history: [50]Sampler.TokenID = undefined;
     for (&history) |*h| h.* = 1;
 
     var logits_copy = logits;
-    const token = sampler.interface.sample(&logits_copy, &history);
-    try std.testing.expectEqual(@as(TokenID, 1), token);
+    const token = sampler.interface.sample(&logits_copy, &history, opts);
+    try std.testing.expectEqual(@as(Sampler.TokenID, 1), token);
 }
 
-// Regression: tokens older than `repetition_penalty_last_n` must NOT
-// be penalized. Without windowing, an old prompt occurrence of a token
-// would still count against it many decode steps later, which compounds
-// over long contexts.
 test "repetition penalty: last_n window excludes old history" {
-    var opts = Options.default;
+    var opts = Sampler.Options.default;
     opts.temperature = 0.0;
     opts.repetition_penalty = 100.0;
     opts.repetition_penalty_last_n = 4;
-    var sampler = init(std.testing.io, opts);
+    var sampler = init(std.testing.io, null);
     const logits = [_]f32{ 1.0, 5.0, 4.9, 0.5 };
 
     // Token 1 appears at history[0], window is last 4 → only history[1..5]
     // is considered. Token 1 is OUT of window, so no penalty. Argmax = 1.
-    const history = [_]TokenID{ 1, 2, 3, 0, 2 };
+    const history = [_]Sampler.TokenID{ 1, 2, 3, 0, 2 };
     var logits_copy = logits;
-    const token = sampler.interface.sample(&logits_copy, &history);
-    try std.testing.expectEqual(@as(TokenID, 1), token);
+    const token = sampler.interface.sample(&logits_copy, &history, opts);
+    try std.testing.expectEqual(@as(Sampler.TokenID, 1), token);
 }
 
-// Regression: negative-logit branch (multiply instead of divide). The
-// original sampler uses asymmetric penalty — positive logits divide,
-// negative logits multiply (push further from zero). Per-unique must
-// apply that branch correctly too, not silently fall back to per-occurrence.
 test "repetition penalty: negative logits scaled per-unique" {
-    var opts = Options.default;
+    var opts = Sampler.Options.default;
     opts.temperature = 0.0;
     opts.repetition_penalty = 2.0;
     opts.repetition_penalty_last_n = 64;
-    var sampler = init(std.testing.io, opts);
+
+    var sampler = init(std.testing.io, null);
 
     // Token 0 starts negative; per-unique penalty: -1.0 * 2.0 = -2.0
     // (pushes further negative). Per-occurrence (broken) over 10 repeats:
@@ -408,9 +384,9 @@ test "repetition penalty: negative logits scaled per-unique" {
     // Token 1 is positive 1.5 — argmax = 1 either way.
     // To distinguish per-unique from per-occurrence cleanly, check the
     // penalized logit is exactly -2.0 (not -1024).
-    const history = [_]TokenID{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    const history = [_]Sampler.TokenID{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
     var logits = [_]f32{ -1.0, 1.5, 0.0 };
-    _ = sampler.interface.sample(&logits, &history);
+    _ = sampler.interface.sample(&logits, &history, opts);
     try std.testing.expectApproxEqAbs(@as(f32, -2.0), logits[0], 0.001);
 }
 
@@ -418,35 +394,34 @@ test "repetition penalty: negative logits scaled per-unique" {
 // expansion across model versions can leave stale token IDs above the
 // current logits.len in serialized history).
 test "repetition penalty: ignores out-of-range token ids" {
-    var opts = Options.default;
+    var opts = Sampler.Options.default;
     opts.temperature = 0.0;
     opts.repetition_penalty = 100.0;
-    var sampler = init(std.testing.io, opts);
+
+    var sampler = init(std.testing.io, null);
     const logits = [_]f32{ 1.0, 5.0, 4.9, 0.5 };
 
     // history[0] is out of range; without skip we'd read OOB / panic.
-    const history = [_]TokenID{ 9999, 1 };
+    const history = [_]Sampler.TokenID{ 9999, 1 };
     var logits_copy = logits;
-    const token = sampler.interface.sample(&logits_copy, &history);
+    const token = sampler.interface.sample(&logits_copy, &history, opts);
     // Token 1 still penalized (in range), so token 2 wins.
-    try std.testing.expectEqual(@as(TokenID, 2), token);
+    try std.testing.expectEqual(@as(Sampler.TokenID, 2), token);
 }
 
 // `sampleWith` must use the explicit options (greedy here) and leave
 // `interface.options` untouched.
 test "sampleWith overrides without mutating options" {
-    var opts = Options.default;
-    opts.seed = 42;
-    var sampler = init(std.testing.io, opts);
+    var sampler = init(std.testing.io, 42);
 
-    var greedy = Options.default;
+    var greedy = Sampler.Options.default;
     greedy.temperature = 0.0;
     greedy.repetition_penalty = 1.0;
 
     var logits = [_]f32{ 1.0, 5.0, 2.0, 3.0 };
-    const token = sampler.interface.sampleWith(&logits, &.{}, greedy);
-    try std.testing.expectEqual(@as(TokenID, 1), token);
-    try std.testing.expectEqual(@as(f32, 0.8), sampler.interface.options.temperature);
+    const token = sampler.interface.sample(&logits, &.{}, greedy);
+    try std.testing.expectEqual(@as(Sampler.TokenID, 1), token);
 }
 
 const std = @import("std");
+const Sampler = @import("sampler.zig");

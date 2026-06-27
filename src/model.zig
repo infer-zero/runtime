@@ -1,84 +1,90 @@
-//! The polymorphic handle for one loaded variant. Like `Context`,
-//! `Tokenizer`, and `Sampler`, this is a view type embedded inside the
-//! family's concrete aggregate (e.g. a heap-allocated `Family`/`Loaded`
-//! struct that owns the weights, vocabulary, and chat overlay); the
-//! vtable methods recover the owner via `@fieldParentPtr("model", m)`.
-//!
-//! Lifecycle: the family's opener heap-allocates the aggregate and
-//! returns `*Model`. Polymorphic callers (the harness runners) tear the
-//! whole variant down with `deinit`; comptime-aware callers that
-//! constructed the concrete aggregate themselves may instead call its
-//! own deinit directly. Contexts created via `createContext` borrow
-//! `tokenizer` and must not outlive the Model.
-
-/// The variant's `Tokenizer` (usually a `Tokenizer.Bpe` owned by the
-/// family; external-library wrappers bring their own implementation).
-tokenizer: *Tokenizer,
-/// Optional chat-template overlay, borrowed from the family aggregate
-/// (stateful implementations embed the `Chat` and point here at its
-/// interface field). Holder only; `ChatSession` is the actual consumer.
-/// Null for completion-only models.
-chat: ?*Chat = null,
-/// Per-family preset table keyed by `Sampler.Profile`. Borrowed —
-/// typically a `pub const` in the family's `common/sampler_defaults.zig`.
-/// Null when the family has not wired presets.
-sampler_presets: ?*const Sampler.Presets = null,
+allocator: std.mem.Allocator,
 vtable: *const VTable,
 
-const Model = @This();
-
 pub const VTable = struct {
-    /// Heap-allocate a `ConcreteContext`, populate its embedded
-    /// `Context` (including the `Context.VTable` pointer), and return
-    /// `&concrete.interface`. The caller owns the returned pointer; see
-    /// `Model.createContext` for the ownership contract.
-    createContext: *const fn (
-        *Model,
-        std.Io,
-        std.mem.Allocator,
-        Context.Options,
-    ) anyerror!*Context,
-
-    /// Tear down the variant's full allocation — weights, caches,
-    /// thread pool, and family aggregate. Polymorphic callers that own
-    /// the Model's lifetime call this on shutdown via `Model.deinit`.
-    destroy: *const fn (*Model) void,
+    encode: *const fn (*Model, []const u8) anyerror![]const u32,
+    decode: *const fn (*Model, []const u32) anyerror![]const u8,
+    createContext: *const fn (*Model) anyerror!Context,
+    destroyContext: *const fn (*Model, Context) void,
+    prefill: *const fn (*Model, Context, []const u32) anyerror!void,
+    generate: *const fn (*Model, Context) anyerror!void,
+    sample: *const fn (*Model, Context, ?Sampler.Options) anyerror!u32,
+    classify: *const fn (*Model, u32) Marker,
+    format: *const fn (*Model, []const Message) anyerror![]const u8,
 };
 
-/// Create a live `Context` for a new conversation. The context uses
-/// `self.tokenizer` for encode/decode. Returns a `*Context` pointing
-/// into an embedded field of a heap-allocated, variant-specific
-/// `ConcreteContext` wrapper. The caller owns that wrapper: comptime-aware
-/// callers recover it via `@fieldParentPtr("interface", ctx)` and call
-/// the variant's `deinit`; polymorphic borrowers (e.g. `ChatSession`)
-/// use the `*Context` and never deinit it.
-pub fn createContext(
-    self: *Model,
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    options: Context.Options,
-) !*Context {
-    return try self.vtable.createContext(self, io, allocator, options);
+pub fn encode(self: *@This(), text: []const u8) ![]const u32 {
+    return self.vtable.encode(self, text);
 }
 
-/// Tear down the variant's full allocation. After this, the Model (and
-/// every pointer borrowed from it — tokenizer, contexts) is dangling.
-pub fn deinit(self: *Model) void {
-    self.vtable.destroy(self);
+pub fn decode(self: *@This(), tokens: []const u32) ![]const u8 {
+    return self.vtable.decode(self, tokens);
 }
 
-/// True iff `token` ends a turn in this model. Raw-completion callers
-/// stop on the tokenizer's designated EOS; chat-capable models may also
-/// emit distinct end-of-turn markers (Qwen's `<|im_end|>`, Llama 3's
-/// `<|eot_id|>`) which `Chat.isEndOfTurn` knows about.
-pub fn isEndOfTurn(self: *const Model, token: u32) bool {
-    if (token == self.tokenizer.eos_token_id) return true;
-    if (self.chat) |c| return c.isEndOfTurn(token);
-    return false;
+pub fn createContext(self: *@This()) !Context {
+    return self.vtable.createContext(self);
 }
+
+pub fn destroyContext(self: *@This(), context: Context) void {
+    return self.vtable.destroyContext(self, context);
+}
+
+pub fn prefill(self: *@This(), context: Context, tokens: []const u32) !void {
+    return self.vtable.prefill(self, context, tokens);
+}
+
+/// This will format with chat template, encode with tokenizer and prefill the tokens.
+pub fn prefillMessages(
+    self: *@This(),
+    context: Context,
+    messages: []const Message,
+) !usize {
+    const formatted = try self.format(messages);
+    defer self.allocator.free(formatted);
+
+    const tokens = try self.encode(formatted);
+    defer self.allocator.free(tokens);
+
+    try self.prefill(context, tokens);
+
+    return tokens.len;
+}
+
+pub fn generate(self: *@This(), context: Context) !void {
+    return self.vtable.generate(self, context);
+}
+
+pub fn sample(self: *@This(), context: Context, options: ?Sampler.Options) !u32 {
+    return self.vtable.sample(self, context, options);
+}
+
+pub fn classify(self: *@This(), token: u32) Marker {
+    return self.vtable.classify(self, token);
+}
+
+pub fn format(self: *@This(), messages: []const Message) ![]const u8 {
+    return self.vtable.format(self, messages);
+}
+
+pub fn next(
+    self: *@This(),
+    context: Context,
+) !struct {
+    marker: Marker,
+    word: []const u8,
+} {
+    try self.generate(context);
+    const token = try self.sample(context, null);
+    const word = try self.decode(&.{token});
+    const marker = self.classify(token);
+    return .{ .marker = marker, .word = word };
+}
+
+const Model = @This();
+pub const Context = *anyopaque;
 
 const std = @import("std");
-const Tokenizer = @import("tokenizer.zig");
-const Sampler = @import("sampler.zig");
-const Context = @import("context.zig");
-const Chat = @import("chat.zig");
+
+pub const Message = @import("message.zig").Message;
+pub const Marker = @import("message.zig").Marker;
+pub const Sampler = @import("sampler.zig");

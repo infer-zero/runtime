@@ -1,51 +1,34 @@
-//! BPE Tokenizer — the default `Tokenizer` implementation — plus the
-//! `Vocabulary` data it operates on (nested below). Built from the
-//! `Vocabulary` loaded by the variant; the variant owns the `Bpe` and
-//! hands `&bpe.interface` to `Model`/`createContext`.
-
-const log = std.log.scoped(.infer);
-
-const std = @import("std");
-const Tokenizer = @import("tokenizer.zig");
-
-const MetaSpace: []const u8 = "▁";
+//! BPE Tokenizer is the default `Tokenizer` implementation.
 
 interface: Tokenizer,
 vocabulary: Vocabulary,
 
-const Bpe = @This();
-
-pub const TokenID = Tokenizer.TokenID;
-
 /// Initialize tokenizer with vocabulary data.
 /// The vocabulary's backing storage must remain valid for the tokenizer's lifetime.
-pub fn init(vocabulary: Vocabulary) Bpe {
+pub fn init(vocabulary: Vocabulary) @This() {
     return .{
         .interface = .{
-            .eos_token_id = vocabulary.eos_token_id,
-            .vtable = &vtable,
+            .vtable = &.{
+                .encode = iencode,
+                .decode = idecode,
+            },
         },
         .vocabulary = vocabulary,
     };
 }
 
-const vtable: Tokenizer.VTable = .{
-    .encode = encodeImpl,
-    .decode = decodeImpl,
-};
-
-fn encodeImpl(iface: *Tokenizer, allocator: std.mem.Allocator, text: []const u8) ![]const TokenID {
-    const self: *Bpe = @fieldParentPtr("interface", iface);
+fn iencode(interface: *Tokenizer, allocator: std.mem.Allocator, text: []const u8) ![]const TokenID {
+    const self: *@This() = @alignCast(@fieldParentPtr("interface", interface));
     return try self.encode(allocator, text);
 }
 
-fn decodeImpl(iface: *Tokenizer, allocator: std.mem.Allocator, tokens: []const TokenID) ![]const u8 {
-    const self: *Bpe = @fieldParentPtr("interface", iface);
+fn idecode(interface: *Tokenizer, allocator: std.mem.Allocator, tokens: []const TokenID) ![]const u8 {
+    const self: *@This() = @alignCast(@fieldParentPtr("interface", interface));
     return try self.decode(allocator, tokens);
 }
 
 /// Decode tokens to text. Returns a freshly allocated, caller-owned slice.
-pub fn decode(self: *const Bpe, allocator: std.mem.Allocator, tokens: []const TokenID) ![]const u8 {
+pub fn decode(self: @This(), allocator: std.mem.Allocator, tokens: []const TokenID) ![]const u8 {
     var text: std.ArrayList(u8) = .empty;
 
     for (tokens) |token| {
@@ -81,17 +64,12 @@ pub fn decode(self: *const Bpe, allocator: std.mem.Allocator, tokens: []const To
     return try text.toOwnedSlice(allocator);
 }
 
-/// Decode a single token to its raw vocabulary form (no byte-level or
-/// MetaSpace post-processing). Borrowed from the vocabulary; "" if the
-/// token is unknown. Bpe-specific — not part of the `Tokenizer`
-/// interface (implementations backed by external libraries can't
-/// return borrowed slices).
-pub fn decodeToken(self: *const Bpe, token: TokenID) []const u8 {
+pub fn decodeToken(self: @This(), token: TokenID) []const u8 {
     return self.vocabulary.decoding.get(token) orelse "";
 }
 
 /// Encode text to tokens. Returns a freshly allocated, caller-owned slice.
-pub fn encode(self: *const Bpe, allocator: std.mem.Allocator, input: []const u8) ![]const TokenID {
+pub fn encode(self: @This(), allocator: std.mem.Allocator, input: []const u8) ![]const TokenID {
     const special_sorted = self.vocabulary.special_tokens_sorted;
 
     var result: std.ArrayList(TokenID) = .empty;
@@ -166,7 +144,12 @@ fn splitOnSpecialTokens(
     }
 }
 
-fn encodeRegularText(self: *const Bpe, allocator: std.mem.Allocator, input: []const u8, result: *std.ArrayList(TokenID)) !void {
+fn encodeRegularText(
+    self: @This(),
+    allocator: std.mem.Allocator,
+    input: []const u8,
+    result: *std.ArrayList(TokenID),
+) !void {
     if (input.len == 0) return;
 
     const normalized = if (self.vocabulary.normalizer) |normalizer|
@@ -193,13 +176,16 @@ fn encodeRegularText(self: *const Bpe, allocator: std.mem.Allocator, input: []co
             const unk_token = self.vocabulary.encoding.get(unk) orelse unreachable;
             try result.append(allocator, unk_token);
         } else {
-            log.err("tokenizer: token not found in vocabulary and no unknown token defined", .{});
             return error.TokenNotFound;
         }
     }
 }
 
-fn splitAndMerge(self: *const Bpe, arena: std.mem.Allocator, input: []const u8) ![]const []const u8 {
+fn splitAndMerge(
+    self: @This(),
+    arena: std.mem.Allocator,
+    input: []const u8,
+) ![]const []const u8 {
     var subwords: std.ArrayList([]const u8) = .empty;
 
     const utf8_view = std.unicode.Utf8View.init(input) catch unreachable;
@@ -252,7 +238,11 @@ fn splitAndMerge(self: *const Bpe, arena: std.mem.Allocator, input: []const u8) 
     return subwords.items;
 }
 
-fn normalize(allocator: std.mem.Allocator, normalizer: Vocabulary.Normalizer, text: []const u8) ![]const u8 {
+fn normalize(
+    allocator: std.mem.Allocator,
+    normalizer: Vocabulary.Normalizer,
+    text: []const u8,
+) ![]const u8 {
     switch (normalizer) {
         .sequence => |seq| {
             var result = text;
@@ -276,7 +266,11 @@ fn normalize(allocator: std.mem.Allocator, normalizer: Vocabulary.Normalizer, te
     }
 }
 
-fn postProcess(allocator: std.mem.Allocator, post_processor: Vocabulary.PostProcessor, tokens: []const TokenID) ![]const TokenID {
+fn postProcess(
+    allocator: std.mem.Allocator,
+    post_processor: Vocabulary.PostProcessor,
+    tokens: []const TokenID,
+) ![]const TokenID {
     switch (post_processor) {
         .sequence => |seq| {
             var result = tokens;
@@ -464,12 +458,6 @@ pub const Vocabulary = struct {
         };
     };
 };
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-const testing = std.testing;
 
 fn createTestVocabulary(allocator: std.mem.Allocator) !Vocabulary {
     var encoding: Vocabulary.EncodingVocabulary = .{};
@@ -817,3 +805,12 @@ test "vocabulary works without merge_pairs field" {
     try testing.expectEqual(@as(usize, 1), tokens.len);
     try testing.expectEqual(@as(TokenID, 2), tokens[0]);
 }
+
+const Bpe = @This();
+const MetaSpace: []const u8 = "▁";
+pub const TokenID = Tokenizer.TokenID;
+
+const std = @import("std");
+const testing = std.testing;
+
+const Tokenizer = @import("tokenizer.zig");
