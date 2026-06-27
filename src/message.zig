@@ -18,55 +18,55 @@ pub const Message = union(enum) {
         tool_calls: []const ToolCall = &.{},
     };
 
-    pub const ToolCall = struct {
-        id: []const u8,
+    pub const ToolSpec = struct {
         name: []const u8,
-        arguments: []const u8,
+        description: []const u8,
+        parameters: []const Parameter,
+    };
+
+    pub const ToolCall = struct {
+        name: []const u8,
+        arguments: []const Argument,
     };
 
     pub const ToolResult = struct {
-        id: []const u8,
         content: []const u8,
+    };
+
+    pub const Argument = struct {
+        name: []const u8,
+        value: Value,
+    };
+
+    pub const Value = union(enum) {
+        string: []const u8,
+        integer: i64,
+        float: f64,
+        boolean: bool,
+    };
+
+    pub const Parameter = struct {
+        name: []const u8,
+        description: []const u8,
+        type: ParameterType,
+    };
+
+    pub const ParameterType = enum {
+        string,
+        integer,
+        float,
+        boolean,
+    };
+
+    pub const Marker = enum {
+        content,
+        turn_start,
+        turn_end,
+        think_start,
+        think_end,
+        tool_call_start,
+        tool_call_end,
     };
 };
 
-pub const ToolSpec = struct {
-    name: []const u8,
-    description: []const u8,
-    parameters: Parameters,
-};
-
-pub const Parameters = union(enum) {
-    simple: []const SimpleParameter,
-    structured: []const StructuredParameter,
-    json_schema: []const u8,
-};
-
-pub const SimpleParameter = struct {
-    name: []const u8,
-    description: []const u8,
-};
-
-pub const StructuredParameter = struct {
-    name: []const u8,
-    description: []const u8,
-    type: StructuredParameterType,
-    required: bool = true,
-};
-
-pub const StructuredParameterType = enum {
-    string,
-    integer,
-    number,
-    boolean,
-};
-
-pub const Marker = enum {
-    content,
-    turn_start,
-    turn_end,
-    think_start,
-    think_end,
-    tool_call_start,
-    tool_call_end,
-};
+const std = @import("std");

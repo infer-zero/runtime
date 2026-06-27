@@ -9,7 +9,7 @@ pub const VTable = struct {
     prefill: *const fn (*Model, Context, []const u32) anyerror!void,
     generate: *const fn (*Model, Context) anyerror!void,
     sample: *const fn (*Model, Context, ?Sampler.Options) anyerror!u32,
-    classify: *const fn (*Model, u32) Marker,
+    classify: *const fn (*Model, u32) Message.Marker,
     format: *const fn (*Model, []const Message) anyerror![]const u8,
 };
 
@@ -58,7 +58,7 @@ pub fn sample(self: *@This(), context: Context, options: ?Sampler.Options) !u32 
     return self.vtable.sample(self, context, options);
 }
 
-pub fn classify(self: *@This(), token: u32) Marker {
+pub fn classify(self: *@This(), token: u32) Message.Marker {
     return self.vtable.classify(self, token);
 }
 
@@ -70,7 +70,7 @@ pub fn next(
     self: *@This(),
     context: Context,
 ) !struct {
-    marker: Marker,
+    marker: Message.Marker,
     word: []const u8,
 } {
     try self.generate(context);
@@ -86,5 +86,4 @@ pub const Context = *anyopaque;
 const std = @import("std");
 
 pub const Message = @import("message.zig").Message;
-pub const Marker = @import("message.zig").Marker;
 pub const Sampler = @import("sampler.zig");

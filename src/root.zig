@@ -9,13 +9,7 @@ pub const TokenizerBPE = @import("tokenizer_bpe.zig");
 pub const Vocabulary = TokenizerBPE.Vocabulary;
 
 const message = @import("message.zig");
-pub const Marker = message.Marker;
 pub const Message = message.Message;
-pub const ToolSpec = message.ToolSpec;
-pub const Parameters = message.Parameters;
-pub const SimpleParameter = message.SimpleParameter;
-pub const StructuredParameter = message.StructuredParameter;
-pub const StructuredParameterType = message.StructuredParameterType;
 
 pub const Model = @import("model.zig");
 
@@ -28,7 +22,7 @@ test {
     _ = SamplerDefault;
     _ = Tokenizer;
     _ = TokenizerBPE;
-    _ = Message;
+    _ = message;
     _ = Model;
 
     _ = download;
