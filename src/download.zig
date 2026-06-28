@@ -9,9 +9,11 @@ pub fn resolve(
 ) ![]const u8 {
     const cache_path = try getCachePath(allocator, environ, "infer");
     defer allocator.free(cache_path);
+    log.debug("Cache dir: {s}", .{cache_path});
 
     const target = try std.fs.path.join(allocator, &.{ cache_path, vendor, repo, file });
     errdefer allocator.free(target);
+    log.debug("Target file: {s}", .{target});
 
     _ = std.Io.Dir.cwd().statFile(io, target, .{}) catch |stat_err| {
         switch (stat_err) {
@@ -26,16 +28,21 @@ pub fn resolve(
                     },
                 );
                 defer allocator.free(url);
+                log.debug("Download URL: {s}", .{url});
 
                 download(io, allocator, url, target, auth_token) catch |download_err| {
+                    log.err("Download error: {any}", .{download_err});
                     return download_err;
                 };
+                log.debug("Download done: {s} -> {s}", .{ url, target });
 
                 return target;
             },
             else => return stat_err,
         }
     };
+
+    log.debug("Resolved file: {s}", .{target});
     return target;
 }
 
@@ -75,14 +82,15 @@ fn download(
 
     const reader = response.reader(read_buffer);
 
-    const basepath = std.fs.path.basename(dest_path);
-    try std.Io.Dir.cwd().createDirPath(io, basepath);
+    const dirname = std.fs.path.dirname(dest_path) orelse unreachable;
+    try std.Io.Dir.cwd().createDirPath(io, dirname);
 
     const write_buffer = try allocator.alloc(u8, 4096);
     defer allocator.free(write_buffer);
 
     var file = try std.Io.Dir.cwd().createFile(io, dest_path, .{});
     defer file.close(io);
+
     var file_writer = file.writer(io, write_buffer);
     const writer = &file_writer.interface;
 
@@ -147,3 +155,5 @@ fn getCachePath(
 
 const std = @import("std");
 const builtin = @import("builtin");
+
+const log = std.log.scoped(.infer);

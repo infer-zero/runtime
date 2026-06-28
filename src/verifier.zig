@@ -103,6 +103,9 @@ pub fn run(
 
             if (!std.mem.eql(u8, test_case.expected, response.items)) {
                 try stdout_writer.print("{s}: FAILED!\n", .{test_case.name});
+                try stdout_writer.print("Whole interation:\n", .{});
+                try stdout_writer.print("{s}\n", .{try model.formatMessages(test_case.input)});
+                try stdout_writer.print("Received response:\n", .{});
                 try stdout_writer.flush();
 
                 try stderr_writer.print("{s}", .{response.items});
@@ -113,40 +116,49 @@ pub fn run(
                 success = false;
             }
 
-            if (!try compareToolCalls(stdout_writer, test_case.expectedToolCalls, tool_calls.items)) {
+            if (success & !try compareToolCalls(stdout_writer, test_case.expectedToolCalls, tool_calls.items)) {
                 try stdout_writer.print("{s}: FAILED!\n", .{test_case.name});
                 try stdout_writer.flush();
                 success = false;
             }
 
             if (success) {
-                try stdout_writer.print("{s}: PASSED!\n", .{test_case.name});
-
                 const prefill_s = @as(f64, @floatFromInt(prefill_ns)) / std.time.ns_per_s;
                 const decode_s = @as(f64, @floatFromInt(decode_ns)) / std.time.ns_per_s;
                 const prefil_tk_s = @as(f64, @floatFromInt(prefill_len)) / prefill_s;
                 const decode_tk_s = @as(f64, @floatFromInt(tokens_decoded)) / decode_s;
 
-                try stdout_writer.print("- pp{d}: {d:.1}tk/s\n", .{ prefill_len, prefil_tk_s });
-                try stdout_writer.print("- tg{d}: {d:.1}tk/s\n", .{ tokens_decoded, decode_tk_s });
-
                 const t_testcase_end = std.Io.Clock.now(.awake, io);
                 const testcase_ms: u64 = @intCast(t_testcase_start.durationTo(t_testcase_end).toMilliseconds());
-                try stdout_writer.print("- Total: {d}ms\n", .{testcase_ms});
-            }
 
-            try stdout_writer.flush();
+                try stdout_writer.print(
+                    "{s}: PASSED! pp{d}: {d:.1}tk/s,  tg{d}: {d:.1}tk/s, total: {d}ms\n",
+                    .{
+                        test_case.name,
+                        prefill_len,
+                        prefil_tk_s,
+                        tokens_decoded,
+                        decode_tk_s,
+                        testcase_ms,
+                    },
+                );
+                try stdout_writer.flush();
+            } else {
+                break;
+            }
         }
     }
 }
 
 pub const TestSuite = struct {
-    model: struct {
-        vendor: []const u8,
-        repository: []const u8,
-        file: []const u8,
-    },
+    model: TestModel,
     test_cases: []const TestCase,
+};
+
+pub const TestModel = struct {
+    vendor: []const u8,
+    repository: []const u8,
+    file: []const u8,
 };
 
 pub const TestCase = struct {
@@ -202,3 +214,5 @@ const Model = @import("model.zig");
 const Sampler = @import("sampler.zig");
 const Message = @import("message.zig").Message;
 const download = @import("download.zig");
+
+const log = std.log.scoped(.infer);
