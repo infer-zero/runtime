@@ -9,8 +9,9 @@ pub const VTable = struct {
     prefill: *const fn (*Model, Context, []const u32) anyerror!void,
     generate: *const fn (*Model, Context) anyerror!void,
     sample: *const fn (*Model, Context, ?Sampler.Options) anyerror!u32,
-    classify: *const fn (*Model, u32) Message.Marker,
-    format: *const fn (*Model, []const Message) anyerror![]const u8,
+    classifyToken: *const fn (*Model, u32) Message.Marker,
+    formatMessages: *const fn (*Model, []const Message) anyerror![]const u8,
+    parseToolCall: *const fn (*Model, []const u8) anyerror![]const Message.ToolCall,
 };
 
 pub fn encode(self: *@This(), text: []const u8) ![]const u32 {
@@ -33,23 +34,6 @@ pub fn prefill(self: *@This(), context: Context, tokens: []const u32) !void {
     return self.vtable.prefill(self, context, tokens);
 }
 
-/// This will format with chat template, encode with tokenizer and prefill the tokens.
-pub fn prefillMessages(
-    self: *@This(),
-    context: Context,
-    messages: []const Message,
-) !usize {
-    const formatted = try self.format(messages);
-    defer self.allocator.free(formatted);
-
-    const tokens = try self.encode(formatted);
-    defer self.allocator.free(tokens);
-
-    try self.prefill(context, tokens);
-
-    return tokens.len;
-}
-
 pub fn generate(self: *@This(), context: Context) !void {
     return self.vtable.generate(self, context);
 }
@@ -58,12 +42,33 @@ pub fn sample(self: *@This(), context: Context, options: ?Sampler.Options) !u32 
     return self.vtable.sample(self, context, options);
 }
 
-pub fn classify(self: *@This(), token: u32) Message.Marker {
-    return self.vtable.classify(self, token);
+pub fn classifyToken(self: *@This(), token: u32) Message.Marker {
+    return self.vtable.classifyToken(self, token);
 }
 
-pub fn format(self: *@This(), messages: []const Message) ![]const u8 {
-    return self.vtable.format(self, messages);
+pub fn formatMessages(self: *@This(), messages: []const Message) ![]const u8 {
+    return self.vtable.formatMessages(self, messages);
+}
+
+pub fn parseToolCall(self: *@This(), message: []const u8) ![]const Message.ToolCall {
+    return self.vtable.parseToolCall(self, message);
+}
+
+/// This will format with chat template, encode with tokenizer and prefill the tokens.
+pub fn prefillMessages(
+    self: *@This(),
+    context: Context,
+    messages: []const Message,
+) !usize {
+    const formatted = try self.formatMessages(messages);
+    defer self.allocator.free(formatted);
+
+    const tokens = try self.encode(formatted);
+    defer self.allocator.free(tokens);
+
+    try self.prefill(context, tokens);
+
+    return tokens.len;
 }
 
 pub fn next(
@@ -76,7 +81,7 @@ pub fn next(
     try self.generate(context);
     const token = try self.sample(context, null);
     const word = try self.decode(&.{token});
-    const marker = self.classify(token);
+    const marker = self.classifyToken(token);
     return .{ .marker = marker, .word = word };
 }
 

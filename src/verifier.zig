@@ -66,23 +66,42 @@ pub fn run(
 
             const t_decode_start = std.Io.Clock.now(.awake, io);
             var tokens_decoded: usize = 0;
+
+            var tool_call_buffer: std.ArrayList(u8) = .empty;
+            var tool_calls: std.ArrayList(Message.ToolCall) = .empty;
+            var is_tool_call: bool = false;
             while (true) {
-                try model.generate(context);
-
-                const next_token = try model.sample(context, greedy);
+                const next = try model.next(context);
+                defer allocator.free(next.word);
                 tokens_decoded += 1;
-                if (model.classify(next_token) == .turn_end) break;
 
-                const next_word = try model.decode(&.{next_token});
-                defer allocator.free(next_word);
-                try response.appendSlice(allocator, next_word);
+                switch (next.marker) {
+                    .turn_end => break,
+                    .tool_call_start => {
+                        is_tool_call = true;
+                        tool_call_buffer.shrinkAndFree(allocator, 0);
+                    },
+                    .tool_call_end => {
+                        is_tool_call = false;
+                        const tool_call = try model.parseToolCall(tool_call_buffer.items);
+                        try tool_calls.appendSlice(allocator, tool_call);
+                    },
+                    .content => {
+                        if (is_tool_call) {
+                            try tool_call_buffer.appendSlice(allocator, next.word);
+                        }
+                    },
+                    else => {},
+                }
+
+                try response.appendSlice(allocator, next.word);
             }
             const t_decode_end = std.Io.Clock.now(.awake, io);
             const decode_ns: u64 = @intCast(t_decode_start.durationTo(t_decode_end).nanoseconds);
 
-            if (std.mem.eql(u8, test_case.expected, response.items)) {
-                try stdout_writer.print("{s}: PASSED!\n", .{test_case.name});
-            } else {
+            var success: bool = true;
+
+            if (!std.mem.eql(u8, test_case.expected, response.items)) {
                 try stdout_writer.print("{s}: FAILED!\n", .{test_case.name});
                 try stdout_writer.flush();
 
@@ -91,20 +110,30 @@ pub fn run(
 
                 try stdout_writer.print("\n", .{});
                 try stdout_writer.flush();
-                return error.TestFailed;
+                success = false;
             }
 
-            const prefill_s = @as(f64, @floatFromInt(prefill_ns)) / std.time.ns_per_s;
-            const decode_s = @as(f64, @floatFromInt(decode_ns)) / std.time.ns_per_s;
-            const prefil_tk_s = @as(f64, @floatFromInt(prefill_len)) / prefill_s;
-            const decode_tk_s = @as(f64, @floatFromInt(tokens_decoded)) / decode_s;
+            if (!try compareToolCalls(stdout_writer, test_case.expectedToolCalls, tool_calls.items)) {
+                try stdout_writer.print("{s}: FAILED!\n", .{test_case.name});
+                try stdout_writer.flush();
+                success = false;
+            }
 
-            try stdout_writer.print("- pp{d}: {d:.1}tk/s\n", .{ prefill_len, prefil_tk_s });
-            try stdout_writer.print("- tg{d}: {d:.1}tk/s\n", .{ tokens_decoded, decode_tk_s });
+            if (success) {
+                try stdout_writer.print("{s}: PASSED!\n", .{test_case.name});
 
-            const t_testcase_end = std.Io.Clock.now(.awake, io);
-            const testcase_ms: u64 = @intCast(t_testcase_start.durationTo(t_testcase_end).toMilliseconds());
-            try stdout_writer.print("- Total: {d}ms\n", .{testcase_ms});
+                const prefill_s = @as(f64, @floatFromInt(prefill_ns)) / std.time.ns_per_s;
+                const decode_s = @as(f64, @floatFromInt(decode_ns)) / std.time.ns_per_s;
+                const prefil_tk_s = @as(f64, @floatFromInt(prefill_len)) / prefill_s;
+                const decode_tk_s = @as(f64, @floatFromInt(tokens_decoded)) / decode_s;
+
+                try stdout_writer.print("- pp{d}: {d:.1}tk/s\n", .{ prefill_len, prefil_tk_s });
+                try stdout_writer.print("- tg{d}: {d:.1}tk/s\n", .{ tokens_decoded, decode_tk_s });
+
+                const t_testcase_end = std.Io.Clock.now(.awake, io);
+                const testcase_ms: u64 = @intCast(t_testcase_start.durationTo(t_testcase_end).toMilliseconds());
+                try stdout_writer.print("- Total: {d}ms\n", .{testcase_ms});
+            }
 
             try stdout_writer.flush();
         }
@@ -124,6 +153,7 @@ pub const TestCase = struct {
     name: []const u8,
     input: []const Message,
     expected: []const u8,
+    expectedToolCalls: []const Message.ToolCall = &.{},
 };
 
 const greedy: Sampler.Options = .{
@@ -134,6 +164,38 @@ const greedy: Sampler.Options = .{
     .repetition_penalty = 1.05,
     .repetition_penalty_last_n = 64,
 };
+
+fn compareToolCalls(
+    writer: *std.Io.Writer,
+    expected_list: []const Message.ToolCall,
+    received_list: []const Message.ToolCall,
+) !bool {
+    if (expected_list.len != received_list.len) {
+        try writer.print("Tool call failed: expected {d} found {d}.", .{ expected_list.len, received_list.len });
+        return false;
+    }
+
+    for (expected_list, 0..) |expected, idx| {
+        const received = received_list[idx];
+        if (!std.mem.eql(u8, expected.name, received.name)) {
+            try writer.print("Exected [{d}].name = `{s}`, received `{s}`.\n", .{ idx, expected.name, received.name });
+            return false;
+        }
+        if (expected.arguments.len != received.arguments.len) {
+            try writer.print("Exected [{d}].arguments.len = `{d}`, received `{d}`.\n", .{ idx, expected.arguments.len, received.arguments.len });
+        }
+        for (expected.arguments, 0..) |expected_arg, arg_idx| {
+            const received_arg = received.arguments[arg_idx];
+            if (!std.mem.eql(u8, expected_arg.name, received_arg.name)) {
+                try writer.print("Exected [{d}].arguments[{d}].name = `{s}`, received `{s}`.\n", .{ idx, arg_idx, expected_arg.name, received_arg.name });
+                return false;
+            }
+            // TODO: test read values
+        }
+    }
+
+    return true;
+}
 
 const std = @import("std");
 const Model = @import("model.zig");
