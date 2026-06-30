@@ -49,6 +49,7 @@ pub fn run(
         const t_init_end = std.Io.Clock.now(.awake, io);
         const init_ms: u64 = @intCast(t_init_start.durationTo(t_init_end).toMilliseconds());
         try stdout_writer.print("Load time: {d}ms\n", .{init_ms});
+        try stdout_writer.flush();
 
         for (test_suite.test_cases) |test_case| {
             const t_testcase_start = std.Io.Clock.now(.awake, io);
@@ -59,8 +60,14 @@ pub fn run(
             var response: std.ArrayList(u8) = .empty;
             defer response.deinit(allocator);
 
+            const input_formatted = try model.formatMessages(test_case.input);
+            defer allocator.free(input_formatted);
+
+            const input_tokens = try model.encode(input_formatted);
+            defer allocator.free(input_tokens);
+
             const t_prefill_start = std.Io.Clock.now(.awake, io);
-            const prefill_len = try model.prefillMessages(context, test_case.input);
+            try model.prefill(context, input_tokens);
             const t_prefill_end = std.Io.Clock.now(.awake, io);
             const prefill_ns: u64 = @intCast(t_prefill_start.durationTo(t_prefill_end).nanoseconds);
 
@@ -71,11 +78,16 @@ pub fn run(
             var tool_calls: std.ArrayList(Message.ToolCall) = .empty;
             var is_tool_call: bool = false;
             while (true) {
-                const next = try model.next(context);
-                defer allocator.free(next.word);
+                try model.generate(context);
+                const token = try model.sample(context, greedy);
+
+                const word = try model.decode(&.{token});
+                defer allocator.free(word);
+
+                const marker = model.classifyToken(token);
                 tokens_decoded += 1;
 
-                switch (next.marker) {
+                switch (marker) {
                     .turn_end => break,
                     .tool_call_start => {
                         is_tool_call = true;
@@ -88,13 +100,13 @@ pub fn run(
                     },
                     .content => {
                         if (is_tool_call) {
-                            try tool_call_buffer.appendSlice(allocator, next.word);
+                            try tool_call_buffer.appendSlice(allocator, word);
                         }
                     },
                     else => {},
                 }
 
-                try response.appendSlice(allocator, next.word);
+                try response.appendSlice(allocator, word);
             }
             const t_decode_end = std.Io.Clock.now(.awake, io);
             const decode_ns: u64 = @intCast(t_decode_start.durationTo(t_decode_end).nanoseconds);
@@ -125,7 +137,7 @@ pub fn run(
             if (success) {
                 const prefill_s = @as(f64, @floatFromInt(prefill_ns)) / std.time.ns_per_s;
                 const decode_s = @as(f64, @floatFromInt(decode_ns)) / std.time.ns_per_s;
-                const prefil_tk_s = @as(f64, @floatFromInt(prefill_len)) / prefill_s;
+                const prefil_tk_s = @as(f64, @floatFromInt(input_tokens.len)) / prefill_s;
                 const decode_tk_s = @as(f64, @floatFromInt(tokens_decoded)) / decode_s;
 
                 const t_testcase_end = std.Io.Clock.now(.awake, io);
@@ -135,7 +147,7 @@ pub fn run(
                     "{s}: PASSED! pp{d}: {d:.1}tk/s,  tg{d}: {d:.1}tk/s, total: {d}ms\n",
                     .{
                         test_case.name,
-                        prefill_len,
+                        input_tokens.len,
                         prefil_tk_s,
                         tokens_decoded,
                         decode_tk_s,
