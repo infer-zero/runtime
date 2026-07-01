@@ -118,6 +118,8 @@ pub fn run(
                 const t_decode_end = std.Io.Clock.now(.awake, io);
                 decode_ns += @intCast(t_decode_start.durationTo(t_decode_end).nanoseconds);
 
+                try model.endTurn(loaded_model, context);
+
                 if (!std.mem.eql(u8, test_turn.expected, response.items)) {
                     try stdout_writer.print("{s}: FAILED!\n", .{test_case.name});
                     try stdout_writer.print("Whole interation:\n", .{});

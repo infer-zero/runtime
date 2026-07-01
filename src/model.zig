@@ -8,6 +8,7 @@ pub const VTable = struct {
     createContext: *const fn (Loaded) anyerror!Context,
     destroyContext: *const fn (Loaded, Context) void,
     prefill: *const fn (Loaded, Context, []const u32) anyerror!void,
+    endTurn: *const fn (Loaded, Context) anyerror!void,
     generate: *const fn (Loaded, Context) anyerror!void,
     sample: *const fn (Loaded, Context, ?Sampler.Options) anyerror!u32,
     classifyToken: *const fn (Loaded, u32) Message.Marker,
@@ -41,6 +42,10 @@ pub fn destroyContext(self: @This(), model: Loaded, context: Context) void {
 
 pub fn prefill(self: @This(), model: Loaded, context: Context, tokens: []const u32) !void {
     return self.vtable.prefill(model, context, tokens);
+}
+
+pub fn endTurn(self: @This(), model: Loaded, context: Context) !void {
+    return self.vtable.endTurn(model, context);
 }
 
 pub fn generate(self: @This(), model: Loaded, context: Context) !void {
