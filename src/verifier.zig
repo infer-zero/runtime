@@ -2,7 +2,7 @@ pub fn run(
     io: std.Io,
     allocator: std.mem.Allocator,
     environ: std.process.Environ,
-    Target: type,
+    model: Model,
     test_suites: []const TestSuite,
 ) !void {
     const stdout_file = std.Io.File.stdout();
@@ -42,9 +42,8 @@ pub fn run(
 
         const t_init_start = std.Io.Clock.now(.awake, io);
 
-        var target: Target = try .init(io, allocator, model_path);
-        defer target.deinit();
-        const model: *Model = &target.interface;
+        const loaded_model = try model.load(io, allocator, model_path);
+        defer model.unload(loaded_model);
 
         const t_init_end = std.Io.Clock.now(.awake, io);
         const init_ms: u64 = @intCast(t_init_start.durationTo(t_init_end).toMilliseconds());
@@ -54,91 +53,98 @@ pub fn run(
         for (test_suite.test_cases) |test_case| {
             const t_testcase_start = std.Io.Clock.now(.awake, io);
 
-            const context = try model.createContext();
-            defer model.destroyContext(context);
-
-            var response: std.ArrayList(u8) = .empty;
-            defer response.deinit(allocator);
-
-            const input_formatted = try model.formatMessages(test_case.input);
-            defer allocator.free(input_formatted);
-
-            const input_tokens = try model.encode(input_formatted);
-            defer allocator.free(input_tokens);
-
-            const t_prefill_start = std.Io.Clock.now(.awake, io);
-            try model.prefill(context, input_tokens);
-            const t_prefill_end = std.Io.Clock.now(.awake, io);
-            const prefill_ns: u64 = @intCast(t_prefill_start.durationTo(t_prefill_end).nanoseconds);
-
-            const t_decode_start = std.Io.Clock.now(.awake, io);
-            var tokens_decoded: usize = 0;
-
-            var tool_call_buffer: std.ArrayList(u8) = .empty;
-            var tool_calls: std.ArrayList(Message.ToolCall) = .empty;
-            var is_tool_call: bool = false;
-            while (true) {
-                try model.generate(context);
-                const token = try model.sample(context, greedy);
-
-                const word = try model.decode(&.{token});
-                defer allocator.free(word);
-
-                const marker = model.classifyToken(token);
-                tokens_decoded += 1;
-
-                switch (marker) {
-                    .turn_end => break,
-                    .tool_call_start => {
-                        is_tool_call = true;
-                        tool_call_buffer.shrinkAndFree(allocator, 0);
-                    },
-                    .tool_call_end => {
-                        is_tool_call = false;
-                        const tool_call = try model.parseToolCall(tool_call_buffer.items);
-                        try tool_calls.appendSlice(allocator, tool_call);
-                    },
-                    .content => {
-                        if (is_tool_call) {
-                            try tool_call_buffer.appendSlice(allocator, word);
-                        }
-                    },
-                    else => {},
-                }
-
-                try response.appendSlice(allocator, word);
-            }
-            const t_decode_end = std.Io.Clock.now(.awake, io);
-            const decode_ns: u64 = @intCast(t_decode_start.durationTo(t_decode_end).nanoseconds);
+            const context = try model.createContext(loaded_model);
+            defer model.destroyContext(loaded_model, context);
 
             var success: bool = true;
 
-            if (!std.mem.eql(u8, test_case.expected, response.items)) {
-                try stdout_writer.print("{s}: FAILED!\n", .{test_case.name});
-                try stdout_writer.print("Whole interation:\n", .{});
-                try stdout_writer.print("{s}\n", .{try model.formatMessages(test_case.input)});
-                try stdout_writer.print("Received response:\n", .{});
-                try stdout_writer.flush();
+            var prefill_len: usize = 0;
+            var prefill_ns: u64 = 0;
+            var decode_len: usize = 0;
+            var decode_ns: u64 = 0;
 
-                try stderr_writer.print("{s}", .{response.items});
-                try stderr_writer.flush();
+            for (test_case.turns) |test_turn| {
+                var response: std.ArrayList(u8) = .empty;
+                defer response.deinit(allocator);
 
-                try stdout_writer.print("\n", .{});
-                try stdout_writer.flush();
-                success = false;
-            }
+                const input_formatted = try model.formatMessages(loaded_model, test_turn.input);
+                defer allocator.free(input_formatted);
 
-            if (success & !try compareToolCalls(stdout_writer, test_case.expectedToolCalls, tool_calls.items)) {
-                try stdout_writer.print("{s}: FAILED!\n", .{test_case.name});
-                try stdout_writer.flush();
-                success = false;
+                const input_tokens = try model.encode(loaded_model, input_formatted);
+                defer allocator.free(input_tokens);
+
+                const t_prefill_start = std.Io.Clock.now(.awake, io);
+                try model.prefill(loaded_model, context, input_tokens);
+                const t_prefill_end = std.Io.Clock.now(.awake, io);
+                prefill_ns += @intCast(t_prefill_start.durationTo(t_prefill_end).nanoseconds);
+                prefill_len += input_tokens.len;
+
+                const t_decode_start = std.Io.Clock.now(.awake, io);
+
+                var tool_call_buffer: std.ArrayList(u8) = .empty;
+                var tool_calls: std.ArrayList(Message.ToolCall) = .empty;
+                var is_tool_call: bool = false;
+                while (true) {
+                    try model.generate(loaded_model, context);
+                    const token = try model.sample(loaded_model, context, greedy);
+
+                    const word = try model.decode(loaded_model, &.{token});
+                    defer allocator.free(word);
+
+                    const marker = model.classifyToken(loaded_model, token);
+                    decode_len += 1;
+
+                    switch (marker) {
+                        .turn_end => break,
+                        .tool_call_start => {
+                            is_tool_call = true;
+                            tool_call_buffer.shrinkAndFree(allocator, 0);
+                        },
+                        .tool_call_end => {
+                            is_tool_call = false;
+                            const tool_call = try model.parseToolCall(loaded_model, tool_call_buffer.items);
+                            try tool_calls.appendSlice(allocator, tool_call);
+                        },
+                        .content => {
+                            if (is_tool_call) {
+                                try tool_call_buffer.appendSlice(allocator, word);
+                            }
+                        },
+                        else => {},
+                    }
+
+                    try response.appendSlice(allocator, word);
+                }
+                const t_decode_end = std.Io.Clock.now(.awake, io);
+                decode_ns += @intCast(t_decode_start.durationTo(t_decode_end).nanoseconds);
+
+                if (!std.mem.eql(u8, test_turn.expected, response.items)) {
+                    try stdout_writer.print("{s}: FAILED!\n", .{test_case.name});
+                    try stdout_writer.print("Whole interation:\n", .{});
+                    try stdout_writer.print("{s}\n", .{input_formatted});
+                    try stdout_writer.print("Received response:\n", .{});
+                    try stdout_writer.flush();
+
+                    try stderr_writer.print("{s}", .{response.items});
+                    try stderr_writer.flush();
+
+                    try stdout_writer.print("\n", .{});
+                    try stdout_writer.flush();
+                    success = false;
+                }
+
+                if (success & !try compareToolCalls(stdout_writer, test_turn.expectedToolCalls, tool_calls.items)) {
+                    try stdout_writer.print("{s}: FAILED!\n", .{test_case.name});
+                    try stdout_writer.flush();
+                    success = false;
+                }
             }
 
             if (success) {
                 const prefill_s = @as(f64, @floatFromInt(prefill_ns)) / std.time.ns_per_s;
                 const decode_s = @as(f64, @floatFromInt(decode_ns)) / std.time.ns_per_s;
-                const prefil_tk_s = @as(f64, @floatFromInt(input_tokens.len)) / prefill_s;
-                const decode_tk_s = @as(f64, @floatFromInt(tokens_decoded)) / decode_s;
+                const prefil_tk_s = @as(f64, @floatFromInt(prefill_len)) / prefill_s;
+                const decode_tk_s = @as(f64, @floatFromInt(decode_len)) / decode_s;
 
                 const t_testcase_end = std.Io.Clock.now(.awake, io);
                 const testcase_ms: u64 = @intCast(t_testcase_start.durationTo(t_testcase_end).toMilliseconds());
@@ -147,9 +153,9 @@ pub fn run(
                     "{s}: PASSED! pp{d}: {d:.1}tk/s,  tg{d}: {d:.1}tk/s, total: {d}ms\n",
                     .{
                         test_case.name,
-                        input_tokens.len,
+                        prefill_len,
                         prefil_tk_s,
-                        tokens_decoded,
+                        decode_len,
                         decode_tk_s,
                         testcase_ms,
                     },
@@ -175,6 +181,10 @@ pub const TestModel = struct {
 
 pub const TestCase = struct {
     name: []const u8,
+    turns: []const TestTurn,
+};
+
+pub const TestTurn = struct {
     input: []const Message,
     expected: []const u8,
     expectedToolCalls: []const Message.ToolCall = &.{},
