@@ -79,6 +79,8 @@ pub fn run(
                 prefill_ns += @intCast(t_prefill_start.durationTo(t_prefill_end).nanoseconds);
                 prefill_len += input_tokens.len;
 
+                try model.startTurn(loaded_model, context);
+
                 const t_decode_start = std.Io.Clock.now(.awake, io);
 
                 var tool_call_buffer: std.ArrayList(u8) = .empty;
